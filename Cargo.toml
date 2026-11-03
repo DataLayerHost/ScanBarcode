@@ -1,0 +1,36 @@
+[package]
+name = "ScanBarcode"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ScanBarcode"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37.0"
+egui = "0.37.0"
+image = { version = "0.25.10", default-features = false, features = [
+	"png",
+	"jpeg",
+	"gif",
+	"webp",
+	"bmp",
+	"tiff",
+] }
+arboard = "3.7.0"
+rfd = "0.17.2"
+chrono = "0.4.45"
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.1", features = ["json"] }
+muda = "0.21.2"
+rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
+sha2 = "0.10.9"
+rxing = { version = "0.9.3", default-features = false, features = [
+	"decoders",
+	"multi_barcode_readers",
+	"full_barcode_format_support",
+	"encoding_rs",
+] }
+

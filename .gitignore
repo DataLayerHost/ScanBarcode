@@ -1,0 +1,37 @@
+# Rust build output
+/target/
+/dist/
+/release/
+Cargo.lock
+*.lock
+
+# Local vendored/temporary dependency overrides
+/vendor/
+
+# Logs and runtime output
+*.log
+*.out
+*.trace
+
+# macOS metadata and build products
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon
+*.dSYM/
+*.app/
+
+# Windows/macOS installer output
+*.dmg
+*.pkg
+*.msi
+*.exe
+*.zip
+*.tar.gz
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
