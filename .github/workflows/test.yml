@@ -20,7 +20,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
