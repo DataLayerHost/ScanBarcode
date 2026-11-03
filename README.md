@@ -72,6 +72,8 @@ cargo build --release
 
 Release packages are produced automatically by GitHub Actions for macOS, Windows, and Linux when a non-prerelease GitHub Release is published. The macOS package is a Finder-openable `.app`; Windows ships a GUI `.exe` without a terminal window; Linux ships a desktop bundle containing a `.desktop` launcher and icon.
 
+The macOS workflow validates and ad-hoc signs the app bundle when Apple Developer ID credentials are not configured. For a download that opens without a Gatekeeper warning, configure Developer ID signing and Apple notarization credentials in the repository; an existing release must be rebuilt after changing those settings.
+
 ## Repository layout
 
 - `src/` — application source

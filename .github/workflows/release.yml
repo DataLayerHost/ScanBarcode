@@ -41,6 +41,8 @@ jobs:
       - name: Package macOS app
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           APP="dist/ScanBarcode.app"
@@ -58,6 +60,15 @@ jobs:
           iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ScanBarcode.icns"
           VERSION="${GITHUB_REF_NAME#v}"
           sed "s/>0.1.0</>$VERSION</g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+          else
+            # Keep the bundle structurally valid for unsigned/open-source builds.
+            # Gatekeeper still requires Developer ID signing and notarization for a
+            # warning-free download; this fallback avoids shipping a malformed app.
+            codesign --force --deep --sign - --timestamp=none "$APP"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/ScanBarcode-${{ github.event.release.tag_name }}-macos.zip"
       - name: Package Windows app
         if: runner.os == 'Windows'
