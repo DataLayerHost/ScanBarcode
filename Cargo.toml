@@ -1,6 +1,6 @@
 [package]
 name = "ScanBarcode"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [[bin]]
@@ -33,4 +33,7 @@ rxing = { version = "0.9.3", default-features = false, features = [
 	"full_barcode_format_support",
 	"encoding_rs",
 ] }
+
+[dev-dependencies]
+rxing = { version = "0.9.3", default-features = false, features = ["encoders"] }
 

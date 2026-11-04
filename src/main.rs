@@ -59,6 +59,9 @@ struct ScanBarcode {
     camera_count: usize,
     camera_names: Vec<String>,
     scanned_text: String,
+    scanned_items: Vec<String>,
+    selected_scan: Option<usize>,
+    dragged_scan: Option<usize>,
     last_action: Option<String>,
     last_deeplink: Option<String>,
     last_camera_value: Option<String>,
@@ -72,6 +75,8 @@ struct ScanBarcode {
     camera_texture: Option<egui::TextureHandle>,
     camera_error: Option<String>,
     confirm_clear: bool,
+    confirm_close: bool,
+    close_confirmed: bool,
     about_open: bool,
     auto_updates: bool,
     update_rx: Option<Receiver<UpdateMessage>>,
@@ -464,6 +469,9 @@ impl ScanBarcode {
             camera_count,
             camera_names,
             scanned_text: String::new(),
+            scanned_items: Vec::new(),
+            selected_scan: None,
+            dragged_scan: None,
             last_action: None,
             last_deeplink: None,
             last_camera_value: None,
@@ -477,6 +485,8 @@ impl ScanBarcode {
             camera_texture: None,
             camera_error: None,
             confirm_clear: false,
+            confirm_close: false,
+            close_confirmed: false,
             about_open: false,
             auto_updates,
             update_rx: None,
@@ -506,12 +516,65 @@ impl ScanBarcode {
         if value.is_empty() {
             return;
         }
-        if !self.scanned_text.is_empty() {
-            self.scanned_text.push('\n');
-        }
-        self.scanned_text.push_str(&value);
+        self.scanned_items.push(value);
+        self.selected_scan = Some(self.scanned_items.len() - 1);
+        self.sync_scanned_text();
         self.last_action = action;
         self.last_deeplink = deeplink;
+    }
+    fn select_scan(&mut self, index: usize) {
+        if index < self.scanned_items.len() {
+            self.selected_scan = Some(index);
+            self.refresh_selected_action();
+        }
+    }
+    fn sync_scanned_text(&mut self) {
+        self.scanned_text = self.scanned_items.join("\n");
+    }
+    fn remove_scan(&mut self, index: usize) {
+        if index < self.scanned_items.len() {
+            self.scanned_items.remove(index);
+            self.selected_scan = match self.selected_scan {
+                Some(selected) if selected == index => self.scanned_items.len().checked_sub(1),
+                Some(selected) if selected > index => Some(selected - 1),
+                other => other,
+            };
+            self.sync_scanned_text();
+            self.refresh_selected_action();
+        }
+    }
+    fn move_scan(&mut self, from: usize, to: usize) {
+        if from < self.scanned_items.len() && to < self.scanned_items.len() && from != to {
+            let item = self.scanned_items.remove(from);
+            self.scanned_items.insert(to, item);
+            self.selected_scan = self.selected_scan.map(|selected| {
+                if selected == from {
+                    to
+                } else if from < selected && to >= selected {
+                    selected - 1
+                } else if from > selected && to <= selected {
+                    selected + 1
+                } else {
+                    selected
+                }
+            });
+            self.sync_scanned_text();
+            self.refresh_selected_action();
+        }
+    }
+    fn move_selected_scan(&mut self, direction: isize) {
+        if let Some(from) = self.selected_scan {
+            if let Some(to) = from.checked_add_signed(direction) {
+                self.move_scan(from, to);
+            }
+        }
+    }
+    fn refresh_selected_action(&mut self) {
+        (self.last_action, self.last_deeplink) = self
+            .selected_scan
+            .and_then(|index| self.scanned_items.get(index))
+            .map(|item| classify_scan(item))
+            .unwrap_or((None, None));
     }
     fn record_decoded(&mut self, code: DetectedCode) {
         if is_barcode_tx_frame(&code.raw_bytes) {
@@ -564,6 +627,9 @@ impl ScanBarcode {
     }
     fn clear(&mut self) {
         self.scanned_text.clear();
+        self.scanned_items.clear();
+        self.selected_scan = None;
+        self.dragged_scan = None;
         self.last_action = None;
         self.last_deeplink = None;
         self.last_camera_value = None;
@@ -573,6 +639,13 @@ impl ScanBarcode {
     fn request_clear(&mut self) {
         if !self.scanned_text.is_empty() {
             self.confirm_clear = true;
+        }
+    }
+    fn request_close(&mut self, ctx: &egui::Context) {
+        if self.scanned_items.is_empty() || self.close_confirmed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.confirm_close = true;
         }
     }
     fn start_update_check(&mut self) {
@@ -685,7 +758,12 @@ impl ScanBarcode {
             .save_file()
         {
             match fs::write(&path, &self.scanned_text) {
-                Ok(()) => self.say(format!("Downloaded {}", filename)),
+                Ok(()) => self.say(format!(
+                    "Downloaded {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| filename.into())
+                )),
                 Err(_) => self.say("Could not write text file"),
             }
         }
@@ -843,6 +921,16 @@ impl ScanBarcode {
                 l((18., 13.), (3., 13.));
                 l((6., 10.), (3., 13.));
                 l((6., 16.), (3., 13.));
+            }
+            "arrow-up" => {
+                l((10., 17.), (10., 3.));
+                l((5., 8.), (10., 3.));
+                l((15., 8.), (10., 3.));
+            }
+            "arrow-down" => {
+                l((10., 3.), (10., 17.));
+                l((5., 12.), (10., 17.));
+                l((15., 12.), (10., 17.));
             }
             "lightbulb" | "lightbulb-off" => {
                 p.circle_stroke(Pos2::new(x + 10., y + 8.), 4., s);
@@ -1220,6 +1308,16 @@ impl eframe::App for ScanBarcode {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.set_visuals(egui::Visuals::dark());
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.scanned_items.is_empty()
+            && !self.close_confirmed
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        let move_shortcut = ctx.input(move_shortcut_direction);
+        let mut move_up = move_shortcut == Some(-1);
+        let mut move_down = move_shortcut == Some(1);
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.camera_on = !self.camera_on;
             self.set_camera_running(self.camera_on);
@@ -1258,6 +1356,7 @@ impl eframe::App for ScanBarcode {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.menu_open = false;
+            self.confirm_close = false;
         }
         #[cfg(target_os = "macos")]
         for event in muda::MenuEvent::receiver().try_iter() {
@@ -1267,6 +1366,8 @@ impl eframe::App for ScanBarcode {
                 "scanbarcode.copy" => self.copy(),
                 "scanbarcode.save" => self.download(),
                 "scanbarcode.clear" => self.request_clear(),
+                "scanbarcode.move_up" => move_up = true,
+                "scanbarcode.move_down" => move_down = true,
                 "scanbarcode.mirror" => self.mirror_camera = !self.mirror_camera,
                 "scanbarcode.camera" => {
                     self.camera_on = !self.camera_on;
@@ -1279,13 +1380,34 @@ impl eframe::App for ScanBarcode {
                     self.select_camera((self.camera_index + 1) % self.camera_count)
                 }
                 "scanbarcode.action" => self.execute(),
+                "scanbarcode.quit" => self.request_close(&ctx),
                 _ => {}
             }
+        }
+        if move_up {
+            self.move_selected_scan(-1);
+        }
+        if move_down {
+            self.move_selected_scan(1);
         }
         self.poll_camera(&ctx);
         self.poll_updates();
         render(self, ui);
         ctx.request_repaint_after(std::time::Duration::from_millis(32));
+    }
+}
+
+fn move_shortcut_direction(input: &egui::InputState) -> Option<isize> {
+    let modifiers = input.modifiers;
+    if !modifiers.shift || modifiers.command || modifiers.ctrl || modifiers.alt {
+        return None;
+    }
+    if input.key_pressed(egui::Key::ArrowUp) {
+        Some(-1)
+    } else if input.key_pressed(egui::Key::ArrowDown) {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -1357,7 +1479,7 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
     if app.menu_open && ctx.input(|input| input.pointer.any_click()) {
         let popup_bounds = Rect::from_min_size(
             Pos2::new(camera.left() + 18., camera.top() + 66.),
-            Vec2::new(245., 500.),
+            Vec2::new(245., 560.),
         );
         let pointer = ctx.input(|input| input.pointer.interact_pos());
         if pointer
@@ -1434,6 +1556,30 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                         ) {
                             app.menu_open = false;
                             app.request_clear();
+                        }
+                        ui.separator();
+                        if menu_item(
+                            ui,
+                            "arrow-up",
+                            "Move selected up",
+                            "⇧↑",
+                            app.selected_scan.is_some_and(|index| index > 0),
+                            false,
+                        ) {
+                            app.move_selected_scan(-1);
+                            app.menu_open = false;
+                        }
+                        if menu_item(
+                            ui,
+                            "arrow-down",
+                            "Move selected down",
+                            "⇧↓",
+                            app.selected_scan
+                                .is_some_and(|index| index + 1 < app.scanned_items.len()),
+                            false,
+                        ) {
+                            app.move_selected_scan(1);
+                            app.menu_open = false;
                         }
                         if menu_item(
                             ui,
@@ -1687,6 +1833,50 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                     });
             });
     }
+    if app.confirm_close {
+        egui::Window::new("Close ScanBarcode")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .fixed_size(Vec2::new(390., 176.))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(&ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(35, 36, 42))
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Close ScanBarcode?").strong().size(16.));
+                        ui.add_space(14.);
+                        ui.label(format!(
+                            "{} scanned item{} will be lost when you close.",
+                            app.scanned_items.len(),
+                            if app.scanned_items.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ));
+                        ui.add_space(18.);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Close anyway")
+                                        .fill(Color32::from_rgb(138, 61, 67))
+                                        .corner_radius(CornerRadius::same(7)),
+                                )
+                                .clicked()
+                            {
+                                app.close_confirmed = true;
+                                app.confirm_close = false;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                app.confirm_close = false;
+                            }
+                        });
+                    });
+            });
+    }
     if app.about_open {
         egui::Window::new("About ScanBarcode")
             .collapsible(false)
@@ -1851,11 +2041,12 @@ fn right_panel(app: &mut ScanBarcode, ui: &mut egui::Ui, rect: Rect) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} codes",
-                        if app.scanned_text.is_empty() {
-                            0
+                        "{} code{}",
+                        app.scanned_items.len(),
+                        if app.scanned_items.len() == 1 {
+                            ""
                         } else {
-                            app.scanned_text.lines().count()
+                            "s"
                         }
                     ))
                     .size(14.)
@@ -1866,16 +2057,7 @@ fn right_panel(app: &mut ScanBarcode, ui: &mut egui::Ui, rect: Rect) {
         });
         ui.add_space(12.);
         let height = (ui.available_height() - 124.).max(180.);
-        let mut text = app.scanned_text.clone();
-        let edit = egui::TextEdit::multiline(&mut text)
-            .desired_rows(12)
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Body)
-            .interactive(false)
-            .hint_text(
-                "Scanned results will appear here and will be cleared when you close the app.",
-            );
-        ui.add_sized(Vec2::new(ui.available_width(), height), edit);
+        scan_rows(app, ui, height);
         if app.barcode_tx.is_active() || app.barcode_tx.result.is_some() {
             ui.add_space(8.);
             let progress = app.barcode_tx.progress().clamp(0., 1.);
@@ -1942,6 +2124,230 @@ fn right_panel(app: &mut ScanBarcode, ui: &mut egui::Ui, rect: Rect) {
             app.execute();
         }
     });
+}
+
+fn scan_rows(app: &mut ScanBarcode, ui: &mut egui::Ui, height: f32) {
+    let width = ui.available_width();
+    let pointer = ui.ctx().pointer_interact_pos();
+    let released = ui.input(|input| input.pointer.any_released());
+    let mut remove = None;
+    let mut select = None;
+    let mut drop_target = None;
+    let mut dropped_scan = None;
+    let mut row_bounds = None;
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.style_mut().spacing.scroll.floating = false;
+            egui::Frame::new()
+                .fill(Color32::from_rgb(25, 26, 32))
+                .corner_radius(8)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(height)
+                        .auto_shrink([false, false])
+                        .content_margin(egui::Margin::ZERO)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if app.scanned_items.is_empty() {
+                                ui.add_space(12.);
+                                ui.label("Scanned results will appear here and will be cleared when you close the app.");
+                            }
+                            for (index, item) in app.scanned_items.iter().enumerate() {
+                                let (row, row_response) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 38.),
+                                    Sense::click(),
+                                );
+                                if row_response.clicked() {
+                                    select = Some(index);
+                                }
+                                row_bounds.get_or_insert(row);
+                                let hovered_drop = row_response.dnd_hover_payload::<usize>().is_some()
+                                    || (app.dragged_scan.is_some()
+                                        && pointer.is_some_and(|position| row.contains(position)));
+                                if hovered_drop {
+                                    drop_target = Some(index);
+                                }
+                                if let Some(from) = row_response.dnd_release_payload::<usize>() {
+                                    dropped_scan = Some((*from, index));
+                                }
+                                let fill = if app.dragged_scan == Some(index) {
+                                    Color32::from_rgb(23, 25, 31)
+                                } else if hovered_drop {
+                                    Color32::from_rgb(49, 72, 91)
+                                } else if app.selected_scan == Some(index) {
+                                    Color32::from_rgb(35, 48, 63)
+                                } else if index % 2 == 0 {
+                                    Color32::from_rgb(31, 33, 40)
+                                } else {
+                                    Color32::from_rgb(27, 29, 36)
+                                };
+                                ui.painter().rect_filled(row, 0., fill);
+                                if app.selected_scan == Some(index) {
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(row.min, Vec2::new(3., row.height())),
+                                        0.,
+                                        Color32::from_rgb(113, 190, 235),
+                                    );
+                                }
+                                ui.painter().line_segment(
+                                    [row.left_bottom(), row.right_bottom()],
+                                    Stroke::new(1., Color32::from_rgb(49, 51, 59)),
+                                );
+                                if hovered_drop && app.dragged_scan != Some(index) {
+                                    ui.painter().line_segment(
+                                        [row.left_top(), row.right_top()],
+                                        Stroke::new(2., Color32::from_rgb(101, 183, 232)),
+                                    );
+                                }
+                                let handle = Rect::from_min_size(row.min, Vec2::new(27., row.height()));
+                                let handle_response = ui.interact(
+                                    handle,
+                                    ui.scope_id().with(("scan_handle", index)),
+                                    Sense::drag(),
+                                );
+                                handle_response.dnd_set_drag_payload(index);
+                                if app.dragged_scan.is_none()
+                                    && handle_response.is_pointer_button_down_on()
+                                {
+                                    app.dragged_scan = Some(index);
+                                }
+                                if handle_response.dragged() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                } else if handle_response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                }
+                                let grip = Color32::from_rgb(138, 145, 157);
+                                for y in [-4., 1., 6.] {
+                                    for x in [-3., 3.] {
+                                        ui.painter().circle_filled(
+                                            Pos2::new(handle.center().x + x, handle.center().y + y),
+                                            1.3,
+                                            grip,
+                                        );
+                                    }
+                                }
+                                let delete = Rect::from_center_size(
+                                    Pos2::new(row.right() - 17., row.center().y),
+                                    Vec2::splat(26.),
+                                );
+                                let delete_response = ui.interact(
+                                    delete,
+                                    ui.scope_id().with(("scan_delete", index)),
+                                    Sense::click(),
+                                ).on_hover_text("Delete row");
+                                if delete_response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if delete_response.clicked() {
+                                    remove = Some(index);
+                                }
+                                ui.painter().text(
+                                    delete.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "×",
+                                    FontId::proportional(19.),
+                                    if delete_response.hovered() {
+                                        Color32::from_rgb(245, 132, 132)
+                                    } else {
+                                        Color32::from_rgb(151, 157, 168)
+                                    },
+                                );
+                                let text_rect = Rect::from_min_max(
+                                    Pos2::new(row.left() + 35., row.top()),
+                                    Pos2::new(delete.left() - 4., row.bottom()),
+                                );
+                                ui.painter().with_clip_rect(text_rect).text(
+                                    Pos2::new(text_rect.left(), row.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    item.replace('\n', " ↵ "),
+                                    FontId::proportional(14.),
+                                    Color32::from_rgb(225, 228, 235),
+                                );
+                                let text_response = ui.interact(
+                                    text_rect,
+                                    ui.scope_id().with(("scan_text", index)),
+                                    Sense::click(),
+                                );
+                                if text_response.clicked() {
+                                    select = Some(index);
+                                }
+                                if text_response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                text_response.on_hover_text(item);
+                            }
+                        });
+                });
+        },
+    );
+    if !released {
+        if let (Some(index), Some(pointer), Some(bounds)) = (app.dragged_scan, pointer, row_bounds)
+        {
+            if let Some(item) = app.scanned_items.get(index) {
+                let ghost = Rect::from_min_size(
+                    Pos2::new(bounds.left(), pointer.y - 19.),
+                    Vec2::new(bounds.width(), 38.),
+                );
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    ui.scope_id().with("scan_drag_preview"),
+                ));
+                painter.rect_filled(
+                    ghost.translate(Vec2::new(2., 3.)),
+                    5.,
+                    Color32::from_black_alpha(95),
+                );
+                painter.rect_filled(ghost, 5., Color32::from_rgb(47, 70, 88));
+                painter.rect_stroke(
+                    ghost,
+                    5.,
+                    Stroke::new(1., Color32::from_rgb(113, 190, 235)),
+                    StrokeKind::Inside,
+                );
+                for y in [-4., 1., 6.] {
+                    for x in [-3., 3.] {
+                        painter.circle_filled(
+                            Pos2::new(ghost.left() + 13. + x, ghost.center().y + y),
+                            1.3,
+                            Color32::from_rgb(197, 216, 230),
+                        );
+                    }
+                }
+                let text_rect = Rect::from_min_max(
+                    Pos2::new(ghost.left() + 35., ghost.top()),
+                    Pos2::new(ghost.right() - 36., ghost.bottom()),
+                );
+                painter.with_clip_rect(text_rect).text(
+                    Pos2::new(text_rect.left(), ghost.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    item.replace('\n', " ↵ "),
+                    FontId::proportional(14.),
+                    Color32::WHITE,
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        }
+    }
+    if let Some(index) = remove {
+        app.remove_scan(index);
+        app.dragged_scan = None;
+    } else if let Some((from, to)) = dropped_scan {
+        app.move_scan(from, to);
+        app.dragged_scan = None;
+    } else if released {
+        if let (Some(from), Some(to)) = (app.dragged_scan.take(), drop_target) {
+            app.move_scan(from, to);
+        }
+    } else if app.dragged_scan.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    if remove.is_none() {
+        if let Some(index) = select {
+            app.select_scan(index);
+        }
+    }
 }
 
 fn action_button(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> bool {
@@ -2036,13 +2442,7 @@ fn load_image(app: &mut ScanBarcode) {
                 .and_then(|file| GifDecoder::new(BufReader::new(file)).ok())
                 .and_then(|decoder| decoder.into_frames().collect_frames().ok())
             {
-                Some(frames) => {
-                    for frame in frames {
-                        let image = frame.into_buffer();
-                        count +=
-                            scan_image_frame(app, image.width(), image.height(), image.into_raw());
-                    }
-                }
+                Some(frames) => count += scan_gif_frames(app, frames),
                 None => app.say(format!("Could not open animated image {name}")),
             }
         } else if let Ok(image) = image::open(&path) {
@@ -2066,6 +2466,21 @@ fn load_image(app: &mut ScanBarcode) {
             ));
         }
     }
+}
+
+fn scan_gif_frames(app: &mut ScanBarcode, frames: Vec<image::Frame>) -> usize {
+    frames
+        .into_iter()
+        .map(|frame| {
+            let image = frame.into_buffer();
+            scan_image_frame(
+                app,
+                image.width(),
+                image.height(),
+                image::DynamicImage::ImageRgba8(image).to_luma8().into_raw(),
+            )
+        })
+        .sum()
 }
 
 fn scan_image_frame(app: &mut ScanBarcode, width: u32, height: u32, pixels: Vec<u8>) -> usize {
@@ -2521,7 +2936,7 @@ fn decode_luma(luma: Vec<u8>, width: u32, height: u32) -> Vec<DetectedCode> {
         .into_iter()
         .filter_map(|result| {
             let text = result.getText().trim().to_owned();
-            (!text.is_empty()).then(|| DetectedCode {
+            (!text.is_empty() || is_barcode_tx_frame(result.getRawBytes())).then(|| DetectedCode {
                 text,
                 format: result.getBarcodeFormat().to_string(),
                 raw_bytes: result.getRawBytes().to_vec(),
@@ -2774,6 +3189,9 @@ fn install_native_menu() {
     let cmd_l = Some(Accelerator::new(cmd, Code::KeyL));
     let cmd_tab = Some(Accelerator::new(cmd, Code::Tab));
     let cmd_enter = Some(Accelerator::new(cmd, Code::Enter));
+    let cmd_q = Some(Accelerator::new(cmd, Code::KeyQ));
+    let shift_up = Some(Accelerator::new(Modifiers::SHIFT, Code::ArrowUp));
+    let shift_down = Some(Accelerator::new(Modifiers::SHIFT, Code::ArrowDown));
     let app_menu = Submenu::with_items(
         "ScanBarcode",
         true,
@@ -2782,7 +3200,7 @@ fn install_native_menu() {
             &PredefinedMenuItem::hide_others(None),
             &PredefinedMenuItem::show_all(None),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::quit(None),
+            &MenuItem::with_id("scanbarcode.quit", "Quit ScanBarcode", true, cmd_q),
         ],
     )
     .expect("create native ScanBarcode menu");
@@ -2810,6 +3228,14 @@ fn install_native_menu() {
                 "Open detected action",
                 true,
                 cmd_enter,
+            ),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id("scanbarcode.move_up", "Move selected up", true, shift_up),
+            &MenuItem::with_id(
+                "scanbarcode.move_down",
+                "Move selected down",
+                true,
+                shift_down,
             ),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::select_all(None),
@@ -2893,18 +3319,179 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_scan, crc32, decode_luma, rgb_to_luma, BarcodeTxDecoder, ScanBarcode};
+    use super::{
+        classify_scan, crc32, decode_luma, move_shortcut_direction, rgb_to_luma, scan_gif_frames,
+        scan_image_frame, scan_rows, BarcodeTxDecoder, ScanBarcode,
+    };
+    use image::{
+        codecs::gif::{GifDecoder, GifEncoder},
+        AnimationDecoder, Frame, Rgba, RgbaImage,
+    };
+    use rxing::{qrcode::QRCodeWriter, BarcodeFormat, Writer};
     use sha2::{Digest, Sha256};
+    use std::io::Cursor;
 
     #[test]
-    fn scans_append_on_new_lines_and_latest_action_wins() {
-        let mut app = ScanBarcode {
+    fn dragging_a_row_moves_it_to_the_drop_row() {
+        use egui::{pos2, vec2, Context, Event, Modifiers, PointerButton, RawInput, Rect};
+
+        let ctx = Context::default();
+        let mut app = test_app();
+        app.record_scan("first", None, None);
+        app.record_scan("second", None, None);
+        let show = |app: &mut ScanBarcode, events| {
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(400., 300.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| scan_rows(app, ui, 200.),
+            );
+            let shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+            shapes
+        };
+        show(&mut app, vec![]);
+        let source = pos2(13., 57.);
+        let destination = pos2(100., 19.);
+        show(
+            &mut app,
+            vec![
+                Event::PointerMoved(source),
+                Event::PointerButton {
+                    pos: source,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(app.dragged_scan, Some(1));
+        let moving = show(&mut app, vec![Event::PointerMoved(destination)]);
+        assert!(moving.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Rect(rect) if rect.fill == egui::Color32::from_rgb(47, 70, 88)
+        )));
+        show(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: destination,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.scanned_items, ["second", "first"]);
+        assert_eq!(app.selected_scan, Some(0));
+        let other_row = pos2(100., 57.);
+        show(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: other_row,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        show(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: other_row,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.selected_scan, Some(1));
+    }
+
+    #[test]
+    fn selected_row_controls_the_detected_action() {
+        let mut app = test_app();
+        app.record_scan(
+            "https://example.com",
+            Some("Open URL".into()),
+            Some("https://example.com".into()),
+        );
+        app.record_scan("plain text", None, None);
+        assert_eq!(app.selected_scan, Some(1));
+        assert!(app.last_action.is_none());
+        app.select_scan(0);
+        assert_eq!(app.last_action.as_deref(), Some("Open URL"));
+        assert_eq!(app.last_deeplink.as_deref(), Some("https://example.com"));
+        app.move_scan(0, 1);
+        assert_eq!(app.selected_scan, Some(1));
+        assert_eq!(app.last_action.as_deref(), Some("Open URL"));
+        app.remove_scan(0);
+        assert_eq!(app.selected_scan, Some(0));
+        assert_eq!(app.last_action.as_deref(), Some("Open URL"));
+        app.remove_scan(0);
+        assert_eq!(app.selected_scan, None);
+        assert!(app.last_deeplink.is_none());
+    }
+
+    #[test]
+    fn shift_arrows_move_the_selected_row_one_place() {
+        use egui::{Context, Event, Key, Modifiers, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app();
+        app.record_scan("first", None, None);
+        app.record_scan("https://example.com", None, None);
+        app.record_scan("third", None, None);
+        app.select_scan(1);
+        let press = |app: &mut ScanBarcode, key, modifiers| {
+            let output = ctx.run_ui(
+                RawInput {
+                    events: vec![
+                        Event::ModifiersChanged(modifiers),
+                        Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |_| {
+                    if let Some(direction) = ctx.input(move_shortcut_direction) {
+                        app.move_selected_scan(direction);
+                    }
+                },
+            );
+            output.drop_without_applying_deltas();
+        };
+        press(&mut app, Key::ArrowUp, Modifiers::SHIFT);
+        assert_eq!(app.scanned_items, ["https://example.com", "first", "third"]);
+        assert_eq!(app.selected_scan, Some(0));
+        assert_eq!(app.last_action.as_deref(), Some("Open URL"));
+        press(&mut app, Key::ArrowUp, Modifiers::SHIFT);
+        assert_eq!(app.selected_scan, Some(0));
+        press(&mut app, Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(app.scanned_items, ["first", "https://example.com", "third"]);
+        assert_eq!(app.selected_scan, Some(1));
+        press(&mut app, Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(app.scanned_items, ["first", "third", "https://example.com"]);
+        assert_eq!(app.selected_scan, Some(2));
+        press(&mut app, Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(app.selected_scan, Some(2));
+        assert_eq!(app.scanned_text, "first\nthird\nhttps://example.com");
+    }
+
+    fn test_app() -> ScanBarcode {
+        ScanBarcode {
             camera_on: true,
             torch_on: false,
             camera_index: 0,
             camera_count: 1,
             camera_names: vec!["Camera 1".into()],
             scanned_text: String::new(),
+            scanned_items: Vec::new(),
+            selected_scan: None,
+            dragged_scan: None,
             last_action: None,
             last_deeplink: None,
             last_camera_value: None,
@@ -2918,14 +3505,21 @@ mod tests {
             camera_texture: None,
             camera_error: None,
             confirm_clear: false,
+            confirm_close: false,
+            close_confirmed: false,
             about_open: false,
             auto_updates: true,
             update_rx: None,
-            update_status: "Version 0.1.0".into(),
+            update_status: format!("Version {}", super::APP_VERSION),
             update_prompt: false,
             update_asset_url: None,
             barcode_tx: BarcodeTxDecoder::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn scans_append_on_new_lines_and_latest_action_wins() {
+        let mut app = test_app();
         app.record_scan("first", None, None);
         app.record_scan(
             "second",
@@ -2933,8 +3527,22 @@ mod tests {
             Some("payto:iban".into()),
         );
         assert_eq!(app.scanned_text, "first\nsecond");
+        assert_eq!(app.scanned_items, ["first", "second"]);
+        assert_eq!(app.selected_scan, Some(1));
         assert_eq!(app.last_action.as_deref(), Some("Open payto"));
         assert_eq!(app.last_deeplink.as_deref(), Some("payto:iban"));
+        app.record_scan("line one\nline two", None, None);
+        assert_eq!(app.scanned_items.len(), 3);
+        assert_eq!(app.selected_scan, Some(2));
+        app.move_scan(2, 0);
+        assert_eq!(app.scanned_items[0], "line one\nline two");
+        assert_eq!(app.selected_scan, Some(0));
+        assert_eq!(app.scanned_text, "line one\nline two\nfirst\nsecond");
+        app.remove_scan(2);
+        assert_eq!(app.scanned_items, ["line one\nline two", "first"]);
+        assert_eq!(app.selected_scan, Some(0));
+        assert_eq!(app.scanned_text, "line one\nline two\nfirst");
+        assert!(app.last_deeplink.is_none());
     }
 
     #[test]
@@ -3063,5 +3671,84 @@ mod tests {
         assert_eq!(result.items.len(), 2);
         assert!(result.items[0].contains("XCB"));
         assert!(result.items[1].contains("XAB"));
+        let mut app = test_app();
+        app.record_barcode_tx_frame(&frame);
+        assert_eq!(app.scanned_items, result.items);
+        assert_eq!(app.scanned_items.len(), 2);
+        assert_eq!(app.scanned_text.lines().count(), 2);
+        assert_eq!(app.selected_scan, Some(1));
+        assert!(app.last_action.is_none());
+    }
+
+    #[test]
+    fn barcode_tx_decodes_tone_app_transaction_batch() {
+        // Generated by Tone's pinned flutter_barcodetx 0.2.0 encoder.
+        let frames: Vec<Vec<u8>> = include_str!("../tests/fixtures/tone_barcodetx_frames.txt")
+            .lines()
+            .map(|hex| {
+                hex.as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(frames.len(), 5);
+        let mut app = test_app();
+        // A repair symbol and source symbols can arrive in any order.
+        for index in [3, 1, 3, 0] {
+            app.record_barcode_tx_frame(&frames[index]);
+        }
+        assert_eq!(app.barcode_tx.received_symbols(), 2);
+        assert_eq!(app.scanned_items.len(), 3);
+        assert_eq!(app.scanned_items[0], "BarcodeTx XCB transaction: a1b2c3d4");
+        assert_eq!(app.scanned_items[1], "BarcodeTx XAB transaction: 01020304");
+        assert_eq!(
+            app.scanned_items[2],
+            format!("BarcodeTx ETH transaction: {}", "ab".repeat(800))
+        );
+        assert_eq!(app.scanned_text.lines().count(), 3);
+        assert_eq!(app.selected_scan, Some(2));
+    }
+
+    #[test]
+    fn barcode_tx_scans_tone_app_binary_qr_images() {
+        let mut app = test_app();
+        for png in [
+            include_bytes!("../tests/fixtures/tone_barcodetx_frame_3.png").as_slice(),
+            include_bytes!("../tests/fixtures/tone_barcodetx_frame_1.png").as_slice(),
+        ] {
+            let image = image::load_from_memory(png).unwrap().to_luma8();
+            let (width, height) = image.dimensions();
+            assert_eq!(
+                scan_image_frame(&mut app, width, height, image.into_raw()),
+                1
+            );
+        }
+        assert_eq!(app.scanned_items.len(), 3);
+        assert_eq!(app.selected_scan, Some(2));
+    }
+
+    #[test]
+    fn animated_gif_scans_each_qr_into_its_own_row() {
+        let frames = ["animated first", "animated second"].map(|value| {
+            let matrix = QRCodeWriter::default()
+                .encode(value, &BarcodeFormat::QR_CODE, 256, 256)
+                .unwrap();
+            Frame::new(RgbaImage::from_fn(256, 256, |x, y| {
+                let shade = if matrix.get(x, y) { 0 } else { 255 };
+                Rgba([shade, shade, shade, 255])
+            }))
+        });
+        let mut gif = Vec::new();
+        GifEncoder::new(&mut gif).encode_frames(frames).unwrap();
+        let decoded = GifDecoder::new(Cursor::new(gif))
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+        let mut app = test_app();
+        assert_eq!(scan_gif_frames(&mut app, decoded), 2);
+        assert_eq!(app.scanned_items, ["animated first", "animated second"]);
+        assert_eq!(app.scanned_text, "animated first\nanimated second");
     }
 }
