@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod update;
+
 use chrono::Local;
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
@@ -18,13 +20,16 @@ use std::{
     io::BufReader,
     path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc,
+    },
     thread,
     time::Duration,
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const UPDATE_API: &str = "https://api.github.com/repos/DataLayerHost/ScanBarcode/releases/latest";
 const CORE_LICENSE_TEXT: &str = include_str!("../LICENSE");
 const BUG_REPORT_URL: &str =
     "https://github.com/DataLayerHost/ScanBarcode/issues/new?template=bug_report.yml";
@@ -82,7 +87,16 @@ struct ScanBarcode {
     update_rx: Option<Receiver<UpdateMessage>>,
     update_status: String,
     update_prompt: bool,
+    update_phase: UpdatePhase,
+    update_version: Option<String>,
+    update_progress: Option<f32>,
+    update_downloaded: u64,
+    update_total: Option<u64>,
+    update_archive: Option<PathBuf>,
+    update_partial: Option<PathBuf>,
+    update_pause: Option<Arc<AtomicBool>>,
     update_asset_url: Option<String>,
+    update_digest: Option<[u8; 32]>,
     barcode_tx: BarcodeTxDecoder,
 }
 
@@ -102,14 +116,20 @@ struct DetectedCode {
     format: String,
     raw_bytes: Vec<u8>,
 }
-enum UpdateMessage {
-    Available {
-        version: String,
-        asset_url: Option<String>,
-    },
-    Error(String),
-    Downloaded(PathBuf),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdatePhase {
+    Idle,
+    Checking,
+    Available,
+    Downloading,
+    Pausing,
+    Paused,
+    Ready,
+    Installing,
+    Error,
 }
+
+use update::UpdateMessage;
 
 #[derive(Default)]
 struct BarcodeTxDecoder {
@@ -492,7 +512,16 @@ impl ScanBarcode {
             update_rx: None,
             update_status: format!("Version {APP_VERSION}"),
             update_prompt: false,
+            update_phase: UpdatePhase::Idle,
+            update_version: None,
+            update_progress: None,
+            update_downloaded: 0,
+            update_total: None,
+            update_archive: None,
+            update_partial: None,
+            update_pause: None,
             update_asset_url: None,
+            update_digest: None,
             barcode_tx: BarcodeTxDecoder::default(),
         };
         if app.camera_on {
@@ -652,98 +681,165 @@ impl ScanBarcode {
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
         thread::spawn(move || {
-            let result = ureq::get(UPDATE_API)
-                .header("User-Agent", "ScanBarcode")
-                .call();
-            let message = match result {
-                Ok(response) => match response.into_body().read_to_string() {
-                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                        Ok(json) => {
-                            let version = json
-                                .get("tag_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim_start_matches('v')
-                                .to_string();
-                            let asset_url =
-                                json.get("assets")
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|assets| {
-                                        assets.iter().find_map(|asset| {
-                                            asset
-                                                .get("browser_download_url")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::to_owned)
-                                        })
-                                    });
-                            if version.is_empty() {
-                                UpdateMessage::Error("GitHub returned no release version".into())
-                            } else {
-                                UpdateMessage::Available { version, asset_url }
-                            }
-                        }
-                        Err(_) => UpdateMessage::Error("Could not read GitHub release data".into()),
-                    },
-                    Err(_) => UpdateMessage::Error("Could not read GitHub release response".into()),
-                },
-                Err(_) => UpdateMessage::Error("Could not check for updates".into()),
-            };
+            let message = update::check_release().unwrap_or_else(UpdateMessage::Error);
             let _ = tx.send(message);
         });
+        self.update_phase = UpdatePhase::Checking;
+        self.update_archive = None;
+        self.update_partial = None;
+        self.update_pause = None;
+        self.update_asset_url = None;
+        self.update_digest = None;
+        self.update_version = None;
+        self.update_progress = None;
         self.update_status = "Checking for updates…".into();
     }
     fn poll_updates(&mut self) {
-        if let Some(rx) = &self.update_rx {
-            while let Ok(message) = rx.try_recv() {
-                match message {
-                    UpdateMessage::Available { version, asset_url } => {
-                        if is_newer_version(&version, APP_VERSION) {
-                            self.update_status = format!("Update {version} available");
-                            self.update_prompt = true;
+        let messages: Vec<_> = self
+            .update_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                UpdateMessage::Available {
+                    version,
+                    asset_url,
+                    sha256,
+                } => {
+                    if is_newer_version(&version, APP_VERSION) {
+                        self.update_phase = if asset_url.is_some() && sha256.is_some() {
+                            UpdatePhase::Available
                         } else {
-                            self.update_status = format!("Version {APP_VERSION} is latest");
-                        }
+                            UpdatePhase::Error
+                        };
+                        self.update_status = if asset_url.is_none() {
+                            "No compatible package was found for this computer".into()
+                        } else if sha256.is_none() {
+                            "GitHub did not provide a valid SHA-256 digest for this package".into()
+                        } else {
+                            format!("Version {version} is ready to download")
+                        };
+                        self.update_prompt = true;
+                        self.update_version = Some(version);
                         self.update_asset_url = asset_url;
-                    }
-                    UpdateMessage::Error(error) => self.update_status = error,
-                    UpdateMessage::Downloaded(path) => {
-                        if let Ok(current) = env::current_exe() {
-                            let backup = current.with_extension("old");
-                            if fs::rename(&current, &backup).is_ok()
-                                && fs::rename(&path, &current).is_ok()
-                            {
-                                let _ = Command::new(&current).spawn();
-                                std::process::exit(0);
-                            }
-                        }
-                        self.update_status = "Update downloaded but could not be installed".into();
+                        self.update_digest = sha256;
+                    } else {
+                        self.update_status = format!("Version {APP_VERSION} is latest");
+                        self.update_phase = UpdatePhase::Idle;
                     }
                 }
+                UpdateMessage::Progress { downloaded, total } => {
+                    self.update_downloaded = downloaded;
+                    self.update_total = total;
+                    self.update_progress = total
+                        .filter(|total| *total > 0)
+                        .map(|total| downloaded as f32 / total as f32);
+                    if self.update_phase == UpdatePhase::Downloading {
+                        self.update_status = "Downloading update…".into();
+                    }
+                }
+                UpdateMessage::Downloaded(path) => {
+                    self.update_archive = Some(path);
+                    self.update_partial = None;
+                    self.update_pause = None;
+                    self.update_phase = UpdatePhase::Ready;
+                    self.update_status = "Download complete — SHA-256 verified".into();
+                    self.update_prompt = true;
+                }
+                UpdateMessage::Paused {
+                    path,
+                    downloaded,
+                    total,
+                } => {
+                    self.update_partial = Some(path);
+                    self.update_pause = None;
+                    self.update_downloaded = downloaded;
+                    self.update_total = total;
+                    self.update_progress = total
+                        .filter(|total| *total > 0)
+                        .map(|total| downloaded as f32 / total as f32);
+                    self.update_phase = UpdatePhase::Paused;
+                    self.update_status = "Download paused. Continue whenever you're ready.".into();
+                    self.update_prompt = true;
+                }
+                UpdateMessage::Prepared(path) => match update::launch_install_helper(&path) {
+                    Ok(()) => std::process::exit(0),
+                    Err(error) => self.update_error(error),
+                },
+                UpdateMessage::Error(error) => self.update_error(error),
             }
         }
     }
+    fn update_error(&mut self, error: String) {
+        if self.update_phase != UpdatePhase::Checking {
+            self.update_prompt = true;
+        }
+        self.update_phase = UpdatePhase::Error;
+        self.update_status = error;
+    }
     fn apply_update(&mut self) {
         let Some(url) = self.update_asset_url.clone() else {
-            self.say("No compatible release download was found");
+            self.update_error("No compatible package was found for this computer".into());
+            return;
+        };
+        let Some(sha256) = self.update_digest else {
+            self.update_error(
+                "GitHub did not provide a valid SHA-256 digest for this package".into(),
+            );
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
+        self.update_phase = UpdatePhase::Downloading;
+        let partial = self.update_partial.take();
+        if partial.is_none() {
+            self.update_progress = None;
+            self.update_downloaded = 0;
+            self.update_total = None;
+        }
         self.update_status = "Downloading update…".into();
+        let pause = Arc::new(AtomicBool::new(false));
+        self.update_pause = Some(pause.clone());
         thread::spawn(move || {
-            let result = ureq::get(url)
-                .call()
-                .and_then(|response| response.into_body().read_to_vec())
-                .and_then(|bytes| {
-                    let path = env::temp_dir().join("scanbarcode-update");
-                    fs::write(&path, bytes)
-                        .map(|_| path)
-                        .map_err(ureq::Error::Io)
-                });
-            let _ = tx.send(match result {
-                Ok(path) => UpdateMessage::Downloaded(path),
-                Err(_) => UpdateMessage::Error("Update download failed".into()),
-            });
+            let message = match update::download_asset(&url, sha256, partial, &pause, &tx) {
+                Ok(update::DownloadOutcome::Downloaded(path)) => UpdateMessage::Downloaded(path),
+                Ok(update::DownloadOutcome::Paused {
+                    path,
+                    downloaded,
+                    total,
+                }) => UpdateMessage::Paused {
+                    path,
+                    downloaded,
+                    total,
+                },
+                Err(error) => UpdateMessage::Error(error),
+            };
+            let _ = tx.send(message);
+        });
+    }
+    fn pause_update(&mut self) {
+        if let Some(pause) = &self.update_pause {
+            pause.store(true, Ordering::Relaxed);
+            self.update_phase = UpdatePhase::Pausing;
+            self.update_status = "Pausing download…".into();
+        }
+    }
+    fn install_update(&mut self) {
+        let Some(archive) = self.update_archive.clone() else {
+            self.update_error("Download the update before installing it".into());
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_phase = UpdatePhase::Installing;
+        self.update_status = "Preparing installation…".into();
+        thread::spawn(move || {
+            let message = match update::prepare_install(&archive) {
+                Ok(path) => UpdateMessage::Prepared(path),
+                Err(error) => UpdateMessage::Error(error),
+            };
+            let _ = tx.send(message);
         });
     }
     fn download(&mut self) {
@@ -1241,10 +1337,6 @@ impl ScanBarcode {
             });
         }
         response.on_hover_text(tooltip).clicked()
-    }
-    fn text_action(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> bool {
-        let width = (label.chars().count() as f32 * 7.2 + 48.).max(80.);
-        Self::text_action_sized(ui, icon, label, enabled, width)
     }
     fn text_action_sized(
         ui: &mut egui::Ui,
@@ -1814,9 +1906,17 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                         ui.add_space(14.);
                         ui.label("Remove all scanned items from this session?");
                         ui.add_space(18.);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
                             if ui
-                                .add(
+                                .add_sized([width, 40.], egui::Button::new("Cancel"))
+                                .clicked()
+                            {
+                                app.confirm_clear = false;
+                            }
+                            if ui
+                                .add_sized(
+                                    [width, 40.],
                                     egui::Button::new("Clear all")
                                         .fill(Color32::from_rgb(138, 61, 67))
                                         .corner_radius(CornerRadius::same(7)),
@@ -1825,9 +1925,6 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                             {
                                 app.confirm_clear = false;
                                 app.clear();
-                            }
-                            if ui.button("Cancel").clicked() {
-                                app.confirm_clear = false;
                             }
                         });
                     });
@@ -1857,9 +1954,17 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                             }
                         ));
                         ui.add_space(18.);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
                             if ui
-                                .add(
+                                .add_sized([width, 40.], egui::Button::new("Cancel"))
+                                .clicked()
+                            {
+                                app.confirm_close = false;
+                            }
+                            if ui
+                                .add_sized(
+                                    [width, 40.],
                                     egui::Button::new("Close anyway")
                                         .fill(Color32::from_rgb(138, 61, 67))
                                         .corner_radius(CornerRadius::same(7)),
@@ -1869,9 +1974,6 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                                 app.close_confirmed = true;
                                 app.confirm_close = false;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            if ui.button("Cancel").clicked() {
-                                app.confirm_close = false;
                             }
                         });
                     });
@@ -1937,10 +2039,23 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                 });
                 ui.add_space(8.);
                 ui.horizontal(|ui| {
-                    if ScanBarcode::text_action(ui, "external-link", "Report bug", true) {
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
+                    if ScanBarcode::text_action_sized(
+                        ui,
+                        "external-link",
+                        "Report bug",
+                        true,
+                        width,
+                    ) {
                         open_external(BUG_REPORT_URL);
                     }
-                    if ScanBarcode::text_action(ui, "external-link", "Request feature", true) {
+                    if ScanBarcode::text_action_sized(
+                        ui,
+                        "external-link",
+                        "Request feature",
+                        true,
+                        width,
+                    ) {
                         open_external(FEATURE_REQUEST_URL);
                     }
                 });
@@ -1986,36 +2101,167 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                         ui.add_space(6.);
                         ui.checkbox(&mut app.auto_updates, "Automatically check for updates");
                         ui.add_space(4.);
+                        let status_color = if app.update_status.contains("latest") {
+                            Color32::from_rgb(145, 220, 176)
+                        } else {
+                            Color32::from_rgb(180, 182, 192)
+                        };
+                        ui.label(egui::RichText::new(&app.update_status).color(status_color));
+                        ui.add_space(8.);
                         ui.horizontal(|ui| {
-                            let status_color = if app.update_status.contains("latest") {
-                                Color32::from_rgb(145, 220, 176)
+                            let update_available = app
+                                .update_version
+                                .as_deref()
+                                .is_some_and(|version| is_newer_version(version, APP_VERSION))
+                                && app.update_phase != UpdatePhase::Checking;
+                            let width = if update_available {
+                                (ui.available_width() - ui.spacing().item_spacing.x) / 2.
                             } else {
-                                Color32::from_rgb(180, 182, 192)
+                                ui.available_width()
                             };
-                            ui.label(egui::RichText::new(&app.update_status).color(status_color));
-                            if ui.button("Check now").clicked() {
+                            if ui
+                                .add_sized([width, 38.], egui::Button::new("Check now"))
+                                .clicked()
+                            {
                                 app.start_update_check();
+                            }
+                            if update_available {
+                                if ui
+                                    .add_sized(
+                                        [width, 38.],
+                                        egui::Button::new("Update now")
+                                            .fill(Color32::from_rgb(60, 108, 162))
+                                            .corner_radius(CornerRadius::same(7)),
+                                    )
+                                    .clicked()
+                                {
+                                    app.about_open = false;
+                                    app.update_prompt = true;
+                                }
                             }
                         });
                     });
             });
     }
     if app.update_prompt {
-        egui::Window::new("Update available")
+        egui::Window::new("Software update")
             .collapsible(false)
             .resizable(false)
+            .title_bar(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&ctx, |ui| {
-                ui.label(&app.update_status);
-                ui.horizontal(|ui| {
-                    if ui.button("Later").clicked() {
-                        app.update_prompt = false;
-                    }
-                    if ui.button("Update now").clicked() {
-                        app.update_prompt = false;
-                        app.apply_update();
-                    }
-                });
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(28, 32, 41))
+                    .stroke(Stroke::new(1., Color32::from_rgb(69, 88, 112)))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(egui::Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_width(430.);
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.), Sense::hover());
+                            let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon_rect));
+                            ScanBarcode::icon(&mut icon_ui, "refresh", Color32::from_rgb(124, 183, 248));
+                            ui.add_space(8.);
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("ScanBarcode update").strong().size(20.));
+                                ui.label(egui::RichText::new(format!(
+                                    "Version {APP_VERSION}  →  {}",
+                                    app.update_version.as_deref().unwrap_or("new version")
+                                )).color(Color32::from_rgb(157, 172, 194)));
+                            });
+                        });
+                        ui.add_space(20.);
+                        match app.update_phase {
+                            UpdatePhase::Available => {
+                                ui.label("A new version is available for this computer.");
+                                ui.label(egui::RichText::new("Download it now, then choose when to install and relaunch.")
+                                    .color(Color32::from_rgb(163, 171, 185)));
+                            }
+                            UpdatePhase::Downloading | UpdatePhase::Pausing | UpdatePhase::Paused => {
+                                ui.label(match app.update_phase {
+                                    UpdatePhase::Pausing => "Pausing download",
+                                    UpdatePhase::Paused => "Download paused",
+                                    _ => "Downloading update",
+                                });
+                                ui.add_space(8.);
+                                if let Some(progress) = app.update_progress {
+                                    ui.add(egui::ProgressBar::new(progress.clamp(0., 1.))
+                                        .desired_width(ui.available_width())
+                                        .show_percentage());
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Connecting to the download…");
+                                    });
+                                }
+                                ui.label(egui::RichText::new(format_download_progress(
+                                    app.update_downloaded,
+                                    app.update_total,
+                                )).color(Color32::from_rgb(163, 171, 185)));
+                                if app.update_phase == UpdatePhase::Paused {
+                                    ui.label(egui::RichText::new("You can continue later while the app stays open.")
+                                        .color(Color32::from_rgb(163, 171, 185)));
+                                }
+                            }
+                            UpdatePhase::Ready => {
+                                ui.label(egui::RichText::new("Download complete")
+                                    .color(Color32::from_rgb(145, 220, 176)).strong());
+                                ui.label("SHA-256 verified against GitHub. Ready to install and relaunch.");
+                            }
+                            UpdatePhase::Installing => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Preparing installation and relaunch…");
+                                });
+                            }
+                            UpdatePhase::Error => {
+                                ui.label(egui::RichText::new(&app.update_status)
+                                    .color(Color32::from_rgb(246, 158, 158)));
+                            }
+                            _ => { ui.label(&app.update_status); }
+                        }
+                        if !app.scanned_items.is_empty() && app.update_phase == UpdatePhase::Ready {
+                            ui.add_space(8.);
+                            ui.label(egui::RichText::new("Save your scan results first; they will close during installation.")
+                                .color(Color32::from_rgb(245, 195, 136)));
+                        }
+                        ui.add_space(22.);
+                        ui.separator();
+                        ui.add_space(12.);
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
+                            if ui.add_sized([width, 42.], egui::Button::new("Later")).clicked() {
+                                app.update_prompt = false;
+                            }
+                                let label = match app.update_phase {
+                                    UpdatePhase::Available => "Download update",
+                                    UpdatePhase::Ready => "Install and relaunch",
+                                    UpdatePhase::Error if app.update_archive.is_some() => "Try installation again",
+                                    UpdatePhase::Error => "Try download again",
+                                    UpdatePhase::Downloading => "Pause download",
+                                    UpdatePhase::Pausing => "Pausing…",
+                                    UpdatePhase::Paused => "Continue download",
+                                    UpdatePhase::Installing => "Installing…",
+                                    _ => "Continue",
+                                };
+                                let enabled = !matches!(app.update_phase, UpdatePhase::Pausing | UpdatePhase::Installing)
+                                    && (app.update_archive.is_some() || (app.update_asset_url.is_some() && app.update_digest.is_some()));
+                                if ui.add_enabled_ui(enabled, |ui| ui.add_sized(
+                                    [width, 42.],
+                                    egui::Button::new(label)
+                                        .fill(Color32::from_rgb(60, 108, 162))
+                                        .corner_radius(CornerRadius::same(8)),
+                                )).inner.clicked() {
+                                    if app.update_phase == UpdatePhase::Downloading {
+                                        app.pause_update();
+                                    } else if app.update_archive.is_some() {
+                                        app.install_update();
+                                    } else {
+                                        app.apply_update();
+                                    }
+                                }
+                        });
+                    });
             });
     }
     if let Some(message) = &app.toast {
@@ -3029,6 +3275,14 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn format_download_progress(downloaded: u64, total: Option<u64>) -> String {
+    let megabytes = |bytes: u64| bytes as f64 / 1_048_576.0;
+    match total {
+        Some(total) => format!("{:.1} of {:.1} MB", megabytes(downloaded), megabytes(total)),
+        None => format!("{:.1} MB downloaded", megabytes(downloaded)),
+    }
+}
+
 fn camera_loop(
     initial_index: usize,
     commands: Receiver<CameraCommand>,
@@ -3512,7 +3766,16 @@ mod tests {
             update_rx: None,
             update_status: format!("Version {}", super::APP_VERSION),
             update_prompt: false,
+            update_phase: super::UpdatePhase::Idle,
+            update_version: None,
+            update_progress: None,
+            update_downloaded: 0,
+            update_total: None,
+            update_archive: None,
+            update_partial: None,
+            update_pause: None,
             update_asset_url: None,
+            update_digest: None,
             barcode_tx: BarcodeTxDecoder::default(),
         }
     }

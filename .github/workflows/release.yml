@@ -59,7 +59,7 @@ jobs:
           done
           iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ScanBarcode.icns"
           VERSION="${GITHUB_REF_NAME#v}"
-          sed "s/>0.1.1</>$VERSION</g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          sed "s/>0.1.2</>$VERSION</g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$APP"
           else
