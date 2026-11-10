@@ -51,16 +51,15 @@ pub fn check_release() -> Result<UpdateMessage, String> {
     let json = fetch_release_json()?;
     let release: serde_json::Value = serde_json::from_str(&json)
         .map_err(|_| "Could not read release information".to_string())?;
-    let version = release
+    let tag = release
         .get("tag_name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim_start_matches('v')
-        .to_owned();
+        .unwrap_or_default();
+    let version = tag.trim_start_matches('v').to_owned();
     if version.is_empty() {
         return Err("The release has no version number".into());
     }
-    let asset = select_asset(&release);
+    let asset = select_asset(&release, asset_suffix());
     Ok(UpdateMessage::Available {
         version,
         asset_url: asset.as_ref().map(|(url, _)| url.clone()),
@@ -97,14 +96,16 @@ fn asset_suffix() -> &'static str {
     }
 }
 
-fn select_asset(release: &serde_json::Value) -> Option<(String, Option<[u8; 32]>)> {
+fn select_asset(release: &serde_json::Value, suffix: &str) -> Option<(String, Option<[u8; 32]>)> {
+    let tag = release.get("tag_name")?.as_str()?;
+    let expected_name = format!("ScanBarcode-{tag}{suffix}");
     release
         .get("assets")?
         .as_array()?
         .iter()
         .find_map(|asset| {
             let name = asset.get("name")?.as_str()?;
-            name.ends_with(asset_suffix()).then(|| {
+            (name == expected_name).then(|| {
                 let url = asset
                     .get("browser_download_url")
                     .and_then(serde_json::Value::as_str)
@@ -357,7 +358,35 @@ pub fn prepare_install(archive: &Path) -> Result<PathBuf, String> {
     if !candidate.join("Contents/MacOS/ScanBarcode").is_file() {
         return Err("The update package has no ScanBarcode app".into());
     }
+    #[cfg(target_os = "macos")]
+    verify_macos_architecture(&candidate.join("Contents/MacOS/ScanBarcode"))?;
     Ok(candidate)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_architecture(binary: &Path) -> Result<(), String> {
+    let expected = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let output = Command::new("/usr/bin/lipo")
+        .arg("-archs")
+        .arg(binary)
+        .output()
+        .map_err(|error| format!("Could not inspect update architecture: {error}"))?;
+    if !output.status.success() {
+        return Err("Could not inspect update architecture".into());
+    }
+    let architectures =
+        std::str::from_utf8(&output.stdout).map_err(|_| "Could not read update architecture")?;
+    if !architectures
+        .split_whitespace()
+        .any(|arch| arch == expected)
+    {
+        return Err(format!("The update package does not support {expected}"));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -445,23 +474,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_matching_release_package() {
+    fn selects_only_the_matching_version_and_architecture() {
         let digest = format!("sha256:{}", "ab".repeat(32));
-        let release = serde_json::json!({"assets": [
-            {"name": "ScanBarcode-v1-windows.zip", "browser_download_url": "wrong-windows", "digest": digest},
-            {"name": "ScanBarcode-v1-linux.tar.gz", "browser_download_url": "wrong-linux", "digest": digest},
-            {"name": "ScanBarcode-v1-macos-arm64.zip", "browser_download_url": "right-macos-arm64", "digest": digest},
-            {"name": "ScanBarcode-v1-macos-x86_64.zip", "browser_download_url": "right-macos-x86_64", "digest": digest}
+        let release = serde_json::json!({"tag_name": "0.1.4", "assets": [
+            {"name": "ScanBarcode-0.1.3-macos-arm64.zip", "browser_download_url": "stale-arm64", "digest": digest},
+            {"name": "Other-0.1.4-macos-arm64.zip", "browser_download_url": "wrong-app", "digest": digest},
+            {"name": "ScanBarcode-0.1.4-windows.zip", "browser_download_url": "windows", "digest": digest},
+            {"name": "ScanBarcode-0.1.4-linux.tar.gz", "browser_download_url": "linux", "digest": digest},
+            {"name": "ScanBarcode-0.1.4-macos-arm64.zip", "browser_download_url": "arm64", "digest": digest},
+            {"name": "ScanBarcode-0.1.4-macos-x86_64.zip", "browser_download_url": "x86_64", "digest": digest}
         ]});
-        let expected = match asset_suffix() {
-            "-macos-arm64.zip" => "right-macos-arm64",
-            "-macos-x86_64.zip" => "right-macos-x86_64",
-            "-windows.zip" => "wrong-windows",
-            _ => "wrong-linux",
-        };
-        let (url, sha256) = select_asset(&release).unwrap();
-        assert_eq!(url, expected);
-        assert_eq!(sha256, Some([0xab; 32]));
+        for (suffix, expected_url) in [
+            ("-macos-arm64.zip", "arm64"),
+            ("-macos-x86_64.zip", "x86_64"),
+            ("-windows.zip", "windows"),
+            ("-linux.tar.gz", "linux"),
+        ] {
+            let (url, sha256) = select_asset(&release, suffix).unwrap();
+            assert_eq!(url, expected_url);
+            assert_eq!(sha256, Some([0xab; 32]));
+        }
+        assert!(select_asset(&release, "-macos-universal.zip").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn checks_the_architecture_before_installing_an_update() {
+        let native_binary = env::current_exe().unwrap();
+        assert!(verify_macos_architecture(&native_binary).is_ok());
+
+        let invalid_binary = update_dir().unwrap().join("invalid-binary");
+        fs::write(&invalid_binary, b"not a Mach-O binary").unwrap();
+        assert!(verify_macos_architecture(&invalid_binary).is_err());
     }
 
     #[test]
@@ -499,11 +543,11 @@ mod tests {
     fn rejects_missing_or_mismatched_sha256() {
         assert!(parse_sha256_digest("sha256:bad").is_none());
         assert!(parse_sha256_digest(&"ab".repeat(32)).is_none());
-        let release = serde_json::json!({"assets": [{
-            "name": format!("ScanBarcode-v1{}", asset_suffix()),
+        let release = serde_json::json!({"tag_name": "0.1.4", "assets": [{
+            "name": format!("ScanBarcode-0.1.4{}", asset_suffix()),
             "browser_download_url": "file:///tmp/update.zip"
         }]});
-        assert!(select_asset(&release).unwrap().1.is_none());
+        assert!(select_asset(&release, asset_suffix()).unwrap().1.is_none());
 
         let source = update_dir().unwrap().join("tampered.zip");
         fs::write(&source, b"tampered update").unwrap();
