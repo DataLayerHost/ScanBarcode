@@ -7,21 +7,21 @@
 	<key>CFBundleExecutable</key>
 	<string>ScanBarcode</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.datalayerhost.scanbarcode</string>
+	<string>host.datalayer.scanbarcode</string>
 	<key>CFBundleName</key>
 	<string>ScanBarcode</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.2</string>
+	<string>0.1.3</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.2</string>
+	<string>0.1.3</string>
 	<key>CFBundleIconFile</key>
 	<string>ScanBarcode.icns</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSCameraUsageDescription</key>
-	<string>ScanBarcode needs camera access to scan codes.</string>
+	<string>ScanBarcode uses your camera to scan barcodes and QR codes.</string>
 	<key>LSUIElement</key>
 	<false/>
 </dict>

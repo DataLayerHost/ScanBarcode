@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+	xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+	xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+	xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+	IgnorableNamespaces="uap uap10 rescap">
+	<Identity Name="@PACKAGE_NAME@" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64" />
+	<Properties>
+		<DisplayName>ScanBarcode</DisplayName>
+		<PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+		<Description>Scan barcodes and QR codes</Description>
+		<Logo>Assets\Logo150.png</Logo>
+	</Properties>
+	<Resources>
+		<Resource Language="en-us" />
+	</Resources>
+	<Dependencies>
+		<TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+	</Dependencies>
+	<Applications>
+		<Application Id="ScanBarcode" Executable="ScanBarcode.exe" uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">
+			<uap:VisualElements DisplayName="ScanBarcode" Description="Scan barcodes and QR codes" Square150x150Logo="Assets\Logo150.png" Square44x44Logo="Assets\Logo44.png" BackgroundColor="transparent" />
+		</Application>
+	</Applications>
+	<Capabilities>
+		<rescap:Capability Name="runFullTrust" />
+		<DeviceCapability Name="webcam" />
+	</Capabilities>
+</Package>

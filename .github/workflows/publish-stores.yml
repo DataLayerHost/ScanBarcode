@@ -1,0 +1,272 @@
+name: Publish to app stores
+
+on:
+  workflow_run:
+    workflows: [Build release packages]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Read completed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name store-release-tag --dir release-meta
+      - id: version
+        name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          TAG="$(cat release-meta/release-tag.txt)"
+          VERSION="$TAG"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Store releases require a tag such as 0.1.3" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  mac-store-build:
+    needs: release
+    if: vars.PUBLISH_MAC_APP_STORE == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native Mac App Store binary
+        run: cargo build --release --features store --target ${{ matrix.target }}
+      - name: Validate native architecture
+        shell: bash
+        run: test "$(lipo -archs target/${{ matrix.target }}/release/ScanBarcode)" = '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: store-macos-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/ScanBarcode
+          retention-days: 1
+
+  mac-app-store:
+    needs: [release, mac-store-build]
+    if: vars.PUBLISH_MAC_APP_STORE == 'true'
+    runs-on: macos-15
+    env:
+      SCANBARCODE_RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      APPLE_STORE_CERTIFICATE_BASE64: ${{ secrets.APPLE_STORE_CERTIFICATE_BASE64 }}
+      APPLE_STORE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_STORE_CERTIFICATE_PASSWORD }}
+      APPLE_STORE_APP_IDENTITY: ${{ vars.APPLE_STORE_APP_IDENTITY }}
+      APPLE_STORE_INSTALLER_IDENTITY: ${{ vars.APPLE_STORE_INSTALLER_IDENTITY }}
+      APPLE_STORE_PROFILE_BASE64: ${{ secrets.APPLE_STORE_PROFILE_BASE64 }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      APP_ID: ${{ vars.APP_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: store-macos-arm64
+          path: binaries/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: store-macos-x86_64
+          path: binaries/x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Install App Store submission tool
+        run: gem install fastlane --no-document
+      - name: Assemble, sign, and submit Mac App Store app
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          for setting in APPLE_STORE_CERTIFICATE_BASE64 APPLE_STORE_CERTIFICATE_PASSWORD APPLE_STORE_APP_IDENTITY APPLE_STORE_INSTALLER_IDENTITY APPLE_STORE_PROFILE_BASE64 APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_TEAM_ID APP_ID; do
+            if [ -z "${!setting:-}" ]; then
+              echo "Missing $setting" >&2
+              exit 1
+            fi
+          done
+          if [ "$APP_ID" != 'host.datalayer.scanbarcode' ]; then
+            echo 'APP_ID must be host.datalayer.scanbarcode' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          lipo -create binaries/arm64/ScanBarcode binaries/x86_64/ScanBarcode -output dist/ScanBarcode-universal
+          test "$(lipo -archs dist/ScanBarcode-universal)" = 'x86_64 arm64' || test "$(lipo -archs dist/ScanBarcode-universal)" = 'arm64 x86_64'
+          APP="dist/ScanBarcode.app"
+          bash packaging/macos/build-app.sh dist/ScanBarcode-universal "$SCANBARCODE_RELEASE_VERSION" "$APP"
+          printf '%s' "$APPLE_STORE_PROFILE_BASE64" | base64 -D > "$APP/Contents/embedded.provisionprofile"
+          PROFILE_PLIST="$RUNNER_TEMP/scanbarcode-store-profile.plist"
+          security cms -D -i "$APP/Contents/embedded.provisionprofile" > "$PROFILE_PLIST"
+          KEYCHAIN="$RUNNER_TEMP/scanbarcode-store.keychain-db"
+          P12="$RUNNER_TEMP/scanbarcode-store.p12"
+          CERT_DER="$RUNNER_TEMP/scanbarcode-store-cert.der"
+          API_KEY_FILE="$RUNNER_TEMP/scanbarcode-store-api-key.json"
+          PKG="$RUNNER_TEMP/ScanBarcode-AppStore-upload.pkg"
+          cleanup() {
+            rm -f "$P12" "$PROFILE_PLIST" "$CERT_DER" "$API_KEY_FILE" "$PKG" "$RUNNER_TEMP/scanbarcode-signed-entitlements.plist"
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          printf '%s' "$APPLE_STORE_CERTIFICATE_BASE64" | base64 -D > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$APPLE_STORE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security find-certificate -c "$APPLE_STORE_APP_IDENTITY" -p "$KEYCHAIN" | openssl x509 -outform DER > "$CERT_DER"
+          python3 packaging/macos/verify-profile.py "$PROFILE_PLIST" "$APPLE_TEAM_ID" "$APP_ID" "$CERT_DER"
+          codesign --force --deep --options runtime --entitlements packaging/macos/AppStore.entitlements --sign "$APPLE_STORE_APP_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          test "$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')" = "$APPLE_TEAM_ID"
+          codesign -d --entitlements :- "$APP" > "$RUNNER_TEMP/scanbarcode-signed-entitlements.plist" 2>/dev/null
+          for entitlement in com.apple.security.app-sandbox com.apple.security.device.camera; do
+            test "$(/usr/libexec/PlistBuddy -c "Print :$entitlement" "$RUNNER_TEMP/scanbarcode-signed-entitlements.plist")" = 'true'
+          done
+          rm -f "$RUNNER_TEMP/scanbarcode-signed-entitlements.plist"
+          productbuild --sign "$APPLE_STORE_INSTALLER_IDENTITY" --component "$APP" /Applications "$PKG"
+          pkgutil --check-signature "$PKG" | grep -F "$APPLE_STORE_INSTALLER_IDENTITY" >/dev/null
+          ruby -rjson -rbase64 -e 'key = ENV.fetch("APPLE_API_KEY_P8"); key = Base64.decode64(key) unless key.start_with?("-----BEGIN"); File.write(ARGV.fetch(0), JSON.generate({key_id: ENV.fetch("APPLE_API_KEY_ID"), issuer_id: ENV.fetch("APPLE_API_ISSUER_ID"), key: key, in_house: false}))' "$API_KEY_FILE"
+          FASTLANE_SKIP_UPDATE_CHECK=1 fastlane deliver --api_key_path "$API_KEY_FILE" --pkg "$PKG" --platform osx --app_identifier "$APP_ID" --app_version "$SCANBARCODE_RELEASE_VERSION" --submit_for_review --automatic_release --skip_metadata --skip_screenshots --force
+
+  microsoft-store:
+    needs: release
+    if: vars.PUBLISH_MICROSOFT_STORE == 'true'
+    runs-on: windows-2025
+    env:
+      SCANBARCODE_RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      MS_PACKAGE_NAME: ${{ vars.MS_PACKAGE_NAME }}
+      MS_PACKAGE_PUBLISHER: ${{ vars.MS_PACKAGE_PUBLISHER }}
+      MS_PUBLISHER_DISPLAY_NAME: ${{ vars.MS_PUBLISHER_DISPLAY_NAME }}
+      MS_PRODUCT_ID: ${{ vars.MS_PRODUCT_ID }}
+      MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+      MS_SELLER_ID: ${{ secrets.MS_SELLER_ID }}
+      MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+      MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Microsoft Store binary
+        run: cargo build --release --features store --target x86_64-pc-windows-msvc
+      - name: Package MSIX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('MS_PACKAGE_NAME', 'MS_PACKAGE_PUBLISHER', 'MS_PUBLISHER_DISPLAY_NAME', 'MS_PRODUCT_ID', 'MS_TENANT_ID', 'MS_SELLER_ID', 'MS_CLIENT_ID', 'MS_CLIENT_SECRET')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing $name" }
+          }
+          $stage = Join-Path $PWD 'dist/msix'
+          New-Item -ItemType Directory -Force -Path "$stage/Assets" | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/ScanBarcode.exe' "$stage/ScanBarcode.exe"
+          Add-Type -AssemblyName System.Drawing
+          $source = [System.Drawing.Image]::FromFile((Resolve-Path 'assets/scanbarcode-icon.png'))
+          try {
+            foreach ($size in @(44, 150)) {
+              $image = [System.Drawing.Bitmap]::new($source, [System.Drawing.Size]::new($size, $size))
+              try { $image.Save("$stage/Assets/Logo$size.png", [System.Drawing.Imaging.ImageFormat]::Png) }
+              finally { $image.Dispose() }
+            }
+          } finally { $source.Dispose() }
+          $version = "$env:SCANBARCODE_RELEASE_VERSION.0"
+          $manifest = Get-Content 'packaging/windows/AppxManifest.xml' -Raw
+          $values = @{
+            '@PACKAGE_NAME@' = $env:MS_PACKAGE_NAME
+            '@PUBLISHER@' = $env:MS_PACKAGE_PUBLISHER
+            '@PUBLISHER_DISPLAY_NAME@' = $env:MS_PUBLISHER_DISPLAY_NAME
+            '@VERSION@' = $version
+          }
+          foreach ($key in $values.Keys) { $manifest = $manifest.Replace($key, [Security.SecurityElement]::Escape($values[$key])) }
+          Set-Content "$stage/AppxManifest.xml" $manifest -Encoding utf8
+          $makeAppx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter makeappx.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\makeappx\.exe$' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeAppx) { throw 'Windows SDK MakeAppx was not found' }
+          & $makeAppx.FullName pack /d $stage /p "dist/ScanBarcode-$version.msix" /o
+          if ($LASTEXITCODE -ne 0) { throw 'MSIX packaging failed' }
+      - uses: microsoft/microsoft-store-apppublisher@v1.4
+      - name: Submit Microsoft Store update
+        shell: pwsh
+        run: |
+          msstore reconfigure --tenantId $env:MS_TENANT_ID --sellerId $env:MS_SELLER_ID --clientId $env:MS_CLIENT_ID --clientSecret $env:MS_CLIENT_SECRET
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication failed' }
+          msstore publish . --inputFile "dist/ScanBarcode-$env:SCANBARCODE_RELEASE_VERSION.0.msix" --appId $env:MS_PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store submission failed' }
+
+  snap-store:
+    needs: release
+    if: vars.PUBLISH_SNAP_STORE == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      SCANBARCODE_RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      SNAP_NAME: ${{ vars.SNAP_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux camera/UI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0
+      - name: Build Snap binary
+        run: cargo build --release --features store --target x86_64-unknown-linux-gnu
+      - name: Prepare Snapcraft project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SNAP_NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then
+            echo 'Set SNAP_NAME to the reserved Snap Store name' >&2
+            exit 1
+          fi
+          mkdir -p dist/snap-stage snap/gui
+          cp target/x86_64-unknown-linux-gnu/release/ScanBarcode dist/snap-stage/ScanBarcode
+          cp assets/scanbarcode-icon.png snap/gui/scanbarcode.png
+          sed 's|^Exec=.*|Exec=scanbarcode|; s|^Icon=.*|Icon=${SNAP}/meta/gui/scanbarcode.png|' packaging/linux/ScanBarcode.desktop > dist/snap-stage/scanbarcode.desktop
+          sed -i "s/^name: .*/name: $SNAP_NAME/; s/^version: .*/version: '$SCANBARCODE_RELEASE_VERSION'/" snap/snapcraft.yaml
+      - uses: snapcore/action-build@v1
+        id: build
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: stable

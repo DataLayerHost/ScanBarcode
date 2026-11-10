@@ -79,9 +79,13 @@ fn fetch_release_json() -> Result<String, String> {
 }
 
 fn asset_suffix() -> &'static str {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "-macos.zip"
+        "-macos-arm64.zip"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "-macos-x86_64.zip"
     }
     #[cfg(target_os = "windows")]
     {
@@ -446,10 +450,12 @@ mod tests {
         let release = serde_json::json!({"assets": [
             {"name": "ScanBarcode-v1-windows.zip", "browser_download_url": "wrong-windows", "digest": digest},
             {"name": "ScanBarcode-v1-linux.tar.gz", "browser_download_url": "wrong-linux", "digest": digest},
-            {"name": "ScanBarcode-v1-macos.zip", "browser_download_url": "right-macos", "digest": digest}
+            {"name": "ScanBarcode-v1-macos-arm64.zip", "browser_download_url": "right-macos-arm64", "digest": digest},
+            {"name": "ScanBarcode-v1-macos-x86_64.zip", "browser_download_url": "right-macos-x86_64", "digest": digest}
         ]});
         let expected = match asset_suffix() {
-            "-macos.zip" => "right-macos",
+            "-macos-arm64.zip" => "right-macos-arm64",
+            "-macos-x86_64.zip" => "right-macos-x86_64",
             "-windows.zip" => "wrong-windows",
             _ => "wrong-linux",
         };

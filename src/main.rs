@@ -470,10 +470,11 @@ impl ScanBarcode {
             .and_then(|s| s.get_string("mirror_camera"))
             .map(|v| v != "false")
             .unwrap_or(true);
-        let auto_updates = storage
-            .and_then(|s| s.get_string("auto_updates"))
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        let auto_updates = !cfg!(feature = "store")
+            && storage
+                .and_then(|s| s.get_string("auto_updates"))
+                .map(|v| v != "false")
+                .unwrap_or(true);
         let show_preview = storage
             .and_then(|s| s.get_string("show_preview"))
             .map(|v| v != "false")
@@ -2099,6 +2100,12 @@ fn render(app: &mut ScanBarcode, ui: &mut egui::Ui) {
                             ui.label(egui::RichText::new("Updates").strong().size(15.));
                         });
                         ui.add_space(6.);
+                        if cfg!(feature = "store") {
+                            ui.label(format!(
+                                "Version {APP_VERSION} · Updates through your app store"
+                            ));
+                            return;
+                        }
                         ui.checkbox(&mut app.auto_updates, "Automatically check for updates");
                         ui.add_space(4.);
                         let status_color = if app.update_status.contains("latest") {

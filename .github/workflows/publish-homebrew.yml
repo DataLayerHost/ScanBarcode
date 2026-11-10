@@ -1,0 +1,97 @@
+name: Publish Homebrew cask
+
+on:
+  workflow_run:
+    workflows: [Build release packages]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  homebrew:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      TAP_REPOSITORY: DataLayerHost/homebrew-tap
+      SOURCE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Check tap credentials
+        shell: bash
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$TAP_DEPLOY_KEY" ]; then
+            echo 'Add a write-enabled deploy key to DataLayerHost/homebrew-tap and save its private key as HOMEBREW_TAP_DEPLOY_KEY in ScanBarcode' >&2
+            exit 1
+          fi
+      - name: Read completed release tag
+        shell: bash
+        run: gh run download "$RUN_ID" --repo "$SOURCE_REPOSITORY" --name store-release-tag --dir release-meta
+      - name: Download and verify signed release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$(cat release-meta/release-tag.txt)"
+          VERSION="$TAG"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Homebrew releases require a tag such as 0.1.3" >&2
+            exit 1
+          fi
+          for arch in arm64 x86_64; do
+            ZIP="ScanBarcode-$TAG-macos-$arch.zip"
+            gh release download "$TAG" --repo "$SOURCE_REPOSITORY" --pattern "$ZIP" --dir dist
+            mkdir -p "extracted/$arch"
+            ditto -x -k "dist/$ZIP" "extracted/$arch"
+            APP="extracted/$arch/ScanBarcode.app"
+            test "$(lipo -archs "$APP/Contents/MacOS/ScanBarcode")" = "$arch"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            xcrun stapler validate "$APP"
+            spctl --assess --type execute --verbose "$APP"
+            echo "sha256_${arch}=$(shasum -a 256 "dist/$ZIP" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          done
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: DataLayerHost/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Update cask in tap
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA256_ARM64: ${{ steps.release.outputs.sha256_arm64 }}
+          SHA256_X86_64: ${{ steps.release.outputs.sha256_x86_64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Casks
+          cat > tap/Casks/scanbarcode.rb <<EOF
+          cask "scanbarcode" do
+            version "$VERSION"
+            arch arm: "arm64", intel: "x86_64"
+            sha256 arm: "$SHA256_ARM64", intel: "$SHA256_X86_64"
+
+            url "https://github.com/$SOURCE_REPOSITORY/releases/download/$TAG/ScanBarcode-$TAG-macos-#{arch}.zip"
+            name "ScanBarcode"
+            desc "Desktop barcode and QR code scanner"
+            homepage "https://github.com/$SOURCE_REPOSITORY"
+
+            app "ScanBarcode.app"
+          end
+          EOF
+          ruby -c tap/Casks/scanbarcode.rb
+          git -C tap config user.name 'github-actions[bot]'
+          git -C tap config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C tap add Casks/scanbarcode.rb
+          if git -C tap diff --cached --quiet; then
+            echo 'Homebrew cask is already current'
+          else
+            git -C tap commit -m "Update ScanBarcode to $TAG"
+            git -C tap push
+          fi

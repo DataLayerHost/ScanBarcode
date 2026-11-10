@@ -70,9 +70,40 @@ The application opens as a native window. On macOS it requests camera permission
 cargo build --release
 ```
 
-Release packages are produced automatically by GitHub Actions for macOS, Windows, and Linux when a non-prerelease GitHub Release is published. The macOS package is a Finder-openable `.app`; Windows ships a GUI `.exe` without a terminal window; Linux ships a desktop bundle containing a `.desktop` launcher and icon.
+Release packages are produced automatically by GitHub Actions for macOS, Windows, and Linux when a non-prerelease GitHub Release is published. macOS has separate ARM64 and Intel ZIP downloads, each containing the native `ScanBarcode.app`; Windows ships a GUI `.exe` without a terminal window; Linux ships a desktop bundle containing a `.desktop` launcher and icon. Direct downloads use the same macOS ZIPs. See [macOS distribution details](docs/macos-app-store.md).
 
-The macOS workflow validates and ad-hoc signs the app bundle when Apple Developer ID credentials are not configured. For a download that opens without a Gatekeeper warning, configure Developer ID signing and Apple notarization credentials in the repository; an existing release must be rebuilt after changing those settings.
+Release signing uses the configured repository secrets and variables:
+
+- macOS: `APPLE_CERTIFICATE_P12` is the base64 content of a Developer ID Application `.p12`; `APPLE_CERTIFICATE_PASSWORD` is its password. `MACOS_SIGNING_IDENTITY`, `APPLE_TEAM_ID`, and `APP_ID` are repository variables. The workflow uses `APPLE_API_KEY_P8` (PEM text or base64), `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID` for notarization. It signs each native app with the hardened runtime, staples the notarization ticket, and attaches both signed app ZIPs to the GitHub Release. Missing credentials fail the macOS release job.
+- Windows: set `WINDOWS_CERTIFICATE_BASE64` (base64 of an exportable code-signing `.pfx`) and `WINDOWS_CERTIFICATE_PASSWORD`. The workflow signs and verifies the `.exe` before packaging. Without these secrets, the `.exe` remains unsigned. Certificates held in hardware or cloud signing services need a different signing integration.
+
+Existing release assets must be rebuilt after configuring signing. Linux's tarball has no platform code-signing requirement.
+
+### Homebrew
+
+Create a public repository named `DataLayerHost/homebrew-tap` (on GitHub: **New repository**, owner **DataLayerHost**, name **homebrew-tap**). Generate a dedicated SSH key pair with `ssh-keygen -t ed25519 -f ~/.ssh/scanbarcode-homebrew-tap -C "ScanBarcode Homebrew publisher" -N ""`. Add `~/.ssh/scanbarcode-homebrew-tap.pub` to `homebrew-tap` under **Settings → Deploy keys → Add deploy key**, with **Allow write access** checked. Add the entire contents of the private key file (`~/.ssh/scanbarcode-homebrew-tap`) to ScanBarcode under **Settings → Secrets and variables → Actions** as `HOMEBREW_TAP_DEPLOY_KEY`. Keep the private key out of the repository and delete local copies after the secret is saved.
+
+After the release workflow succeeds, `.github/workflows/publish-homebrew.yml` downloads both notarized macOS ZIPs, verifies their signatures and stapled tickets, calculates their SHA-256 hashes, and updates `Casks/scanbarcode.rb` in the tap. Homebrew selects the matching native app for Apple Silicon or Intel. Once the tap is populated, install with:
+
+```sh
+brew install --cask DataLayerHost/tap/scanbarcode
+```
+
+### App store publishing
+
+After the release packaging workflow succeeds, `.github/workflows/publish-stores.yml` can submit store-specific builds. Store builds use the `store` Cargo feature, which disables the GitHub self-updater; users receive updates through their store. Tags use `MAJOR.MINOR.PATCH` without a prefix (for example, `0.1.3`) and must match `Cargo.toml`. Each store job is enabled separately by a repository variable, so unconfigured stores are skipped.
+
+| Store | Repository variables | Repository secrets |
+| --- | --- | --- |
+| Mac App Store | `PUBLISH_MAC_APP_STORE=true`, `APPLE_TEAM_ID`, `APP_ID`, `APPLE_STORE_APP_IDENTITY`, `APPLE_STORE_INSTALLER_IDENTITY` | `APPLE_STORE_CERTIFICATE_BASE64`, `APPLE_STORE_CERTIFICATE_PASSWORD`, `APPLE_STORE_PROFILE_BASE64`, plus the existing `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
+| Microsoft Store | `PUBLISH_MICROSOFT_STORE=true`, `MS_PACKAGE_NAME`, `MS_PACKAGE_PUBLISHER`, `MS_PUBLISHER_DISPLAY_NAME`, `MS_PRODUCT_ID` | `MS_TENANT_ID`, `MS_SELLER_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET` |
+| Snap Store | `PUBLISH_SNAP_STORE=true`, `SNAP_NAME` | `SNAPCRAFT_STORE_CREDENTIALS` |
+
+The Mac App Store certificate secret is a base64 `.p12` containing the Apple Distribution application identity and Mac Installer Distribution identity. The profile secret is a base64 Mac App Store Connect provisioning profile for `host.datalayer.scanbarcode`. The workflow builds a universal sandboxed `ScanBarcode.app`, creates a signed `.pkg` only as a temporary App Store upload container, deletes it after upload, and requests automatic release after App Review approval. The existing Developer ID certificate for GitHub downloads cannot be reused for this Store build.
+
+For Microsoft Store, copy the package name and publisher identity exactly from Partner Center; the workflow builds a separate MSIX package and submits it with the [Microsoft Store Developer CLI](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/overview). The first listing and first publication must be completed in Partner Center before CLI updates can run. The Microsoft Store re-signs submitted MSIX packages, so the Windows `.pfx` used for GitHub downloads is not required for this job.
+
+For Snap Store, reserve `SNAP_NAME` and create a scoped `SNAPCRAFT_STORE_CREDENTIALS` value with `snapcraft export-login`. The workflow builds a strictly confined snap and releases it to `stable` after Snap Store review. The `camera` interface normally needs a user connection (`sudo snap connect SNAP_NAME:camera`) unless the store grants auto-connection. Test camera, image picker, Wi-Fi actions, and audio on installed store builds before enabling production publication.
 
 ## Repository layout
 
