@@ -37,4 +37,4 @@ DataLayer does not retain camera images, selected images, or scan results on a S
 
 ## Changes and contact
 
-We may update this policy if the app's data practices change. The effective date above will reflect the latest version. For privacy questions, contact DataLayer through the [ScanBarcode GitHub issue tracker](https://github.com/DataLayerHost/ScanBarcode/issues/new/choose). Avoid posting sensitive information in a public issue.
+We may update this policy if the app's data practices change. The effective date above will reflect the latest version. For privacy questions, use the [ScanBarcode privacy question template](https://github.com/DataLayerHost/ScanBarcode/issues/new?template=privacy_request.yml). GitHub issues are public; do not post sensitive information or scan contents.

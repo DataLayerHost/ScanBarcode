@@ -1,0 +1,49 @@
+name: Privacy question
+description: Ask about ScanBarcode's privacy policy or data handling
+title: "[Privacy]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue will be public. Do not include scanned codes, camera images, contact details, account information, or other sensitive data. Read the [privacy policy](https://github.com/DataLayerHost/ScanBarcode/blob/main/docs/privacy-policy.md) first.
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      options:
+        - Privacy policy question
+        - Camera or image handling
+        - Local files or settings
+        - Update checks or external apps
+        - Data deletion guidance
+        - Other privacy concern
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question or concern
+      description: Describe the issue in general terms without posting personal information or scan contents.
+    validations:
+      required: true
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: How did you install ScanBarcode?
+      options:
+        - Mac App Store
+        - GitHub release or direct download
+        - Homebrew
+        - Microsoft Store
+        - Snap Store
+        - Built from source
+        - Not sure
+    validations:
+      required: false
+  - type: checkboxes
+    id: public_issue
+    attributes:
+      label: Public issue reminder
+      options:
+        - label: I have removed personal information and scan contents from this issue.
+          required: true
