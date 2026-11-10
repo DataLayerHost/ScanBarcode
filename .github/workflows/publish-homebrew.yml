@@ -1,4 +1,4 @@
-name: Publish Homebrew cask
+name: Publish Homebrew cask for macOS and Linux
 
 on:
   workflow_run:
@@ -31,7 +31,7 @@ jobs:
       - name: Read completed release tag
         shell: bash
         run: gh run download "$RUN_ID" --repo "$SOURCE_REPOSITORY" --name store-release-tag --dir release-meta
-      - name: Download and verify signed release
+      - name: Download and verify release packages
         id: release
         shell: bash
         run: |
@@ -54,35 +54,66 @@ jobs:
             spctl --assess --type execute --verbose "$APP"
             echo "sha256_${arch}=$(shasum -a 256 "dist/$ZIP" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           done
+          for linux_arch in x86_64 arm64; do
+            if [ "$linux_arch" = arm64 ]; then
+              suffix=linux-arm64
+              machine='ARM aarch64'
+            else
+              suffix=linux
+              machine='x86-64'
+            fi
+            LINUX_ARCHIVE="ScanBarcode-$TAG-$suffix.tar.gz"
+            gh release download "$TAG" --repo "$SOURCE_REPOSITORY" --pattern "$LINUX_ARCHIVE" --dir dist
+            tar -tzf "dist/$LINUX_ARCHIVE" | grep -Fxq "ScanBarcode-$TAG-$suffix/ScanBarcode"
+            mkdir -p "extracted/$suffix"
+            tar -xzf "dist/$LINUX_ARCHIVE" -C "extracted/$suffix"
+            LINUX_BINARY="extracted/$suffix/ScanBarcode-$TAG-$suffix/ScanBarcode"
+            test -x "$LINUX_BINARY"
+            file "$LINUX_BINARY" | grep -Fq "$machine"
+            echo "sha256_linux_${linux_arch}=$(shasum -a 256 "dist/$LINUX_ARCHIVE" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          done
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: DataLayerHost/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
-      - name: Update cask in tap
+      - name: Update macOS and Linux cask in tap
         shell: bash
         env:
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
           SHA256_ARM64: ${{ steps.release.outputs.sha256_arm64 }}
           SHA256_X86_64: ${{ steps.release.outputs.sha256_x86_64 }}
+          SHA256_LINUX_X86_64: ${{ steps.release.outputs.sha256_linux_x86_64 }}
+          SHA256_LINUX_ARM64: ${{ steps.release.outputs.sha256_linux_arm64 }}
         run: |
           set -euo pipefail
           mkdir -p tap/Casks
           cat > tap/Casks/scanbarcode.rb <<EOF
           cask "scanbarcode" do
             version "$VERSION"
-            arch arm: "arm64", intel: "x86_64"
-            sha256 arm: "$SHA256_ARM64", intel: "$SHA256_X86_64"
 
-            url "https://github.com/$SOURCE_REPOSITORY/releases/download/$TAG/ScanBarcode-$TAG-macos-#{arch}.zip"
+            on_macos do
+              arch arm: "arm64", intel: "x86_64"
+              sha256 arm: "$SHA256_ARM64", intel: "$SHA256_X86_64"
+              url "https://github.com/$SOURCE_REPOSITORY/releases/download/$TAG/ScanBarcode-$TAG-macos-#{arch}.zip"
+
+              app "ScanBarcode.app"
+            end
+
+            on_linux do
+              arch arm: "-arm64"
+              sha256 arm64_linux: "$SHA256_LINUX_ARM64", x86_64_linux: "$SHA256_LINUX_X86_64"
+              url "https://github.com/$SOURCE_REPOSITORY/releases/download/$TAG/ScanBarcode-$TAG-linux#{arch}.tar.gz"
+
+              binary "ScanBarcode-#{version}-linux#{arch}/ScanBarcode", target: "scanbarcode"
+            end
+
             name "ScanBarcode"
             desc "Desktop barcode and QR code scanner"
             homepage "https://github.com/$SOURCE_REPOSITORY"
-
-            app "ScanBarcode.app"
           end
           EOF
           ruby -c tap/Casks/scanbarcode.rb

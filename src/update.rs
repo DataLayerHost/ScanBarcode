@@ -90,9 +90,13 @@ fn asset_suffix() -> &'static str {
     {
         "-windows.zip"
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         "-linux.tar.gz"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "-linux-arm64.tar.gz"
     }
 }
 
@@ -360,7 +364,27 @@ pub fn prepare_install(archive: &Path) -> Result<PathBuf, String> {
     }
     #[cfg(target_os = "macos")]
     verify_macos_architecture(&candidate.join("Contents/MacOS/ScanBarcode"))?;
+    #[cfg(target_os = "linux")]
+    verify_linux_architecture(&candidate)?;
     Ok(candidate)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_architecture(binary: &Path) -> Result<(), String> {
+    let mut header = [0u8; 20];
+    fs::File::open(binary)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| format!("Could not inspect update architecture: {error}"))?;
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    let expected_machine = if cfg!(target_arch = "aarch64") {
+        183
+    } else {
+        62
+    };
+    if header[..6] != *b"\x7fELF\x02\x01" || machine != expected_machine {
+        return Err("The update package does not support this Linux architecture".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -481,6 +505,7 @@ mod tests {
             {"name": "Other-0.1.4-macos-arm64.zip", "browser_download_url": "wrong-app", "digest": digest},
             {"name": "ScanBarcode-0.1.4-windows.zip", "browser_download_url": "windows", "digest": digest},
             {"name": "ScanBarcode-0.1.4-linux.tar.gz", "browser_download_url": "linux", "digest": digest},
+            {"name": "ScanBarcode-0.1.4-linux-arm64.tar.gz", "browser_download_url": "linux-arm64", "digest": digest},
             {"name": "ScanBarcode-0.1.4-macos-arm64.zip", "browser_download_url": "arm64", "digest": digest},
             {"name": "ScanBarcode-0.1.4-macos-x86_64.zip", "browser_download_url": "x86_64", "digest": digest}
         ]});
@@ -489,12 +514,41 @@ mod tests {
             ("-macos-x86_64.zip", "x86_64"),
             ("-windows.zip", "windows"),
             ("-linux.tar.gz", "linux"),
+            ("-linux-arm64.tar.gz", "linux-arm64"),
         ] {
             let (url, sha256) = select_asset(&release, suffix).unwrap();
             assert_eq!(url, expected_url);
             assert_eq!(sha256, Some([0xab; 32]));
         }
         assert!(select_asset(&release, "-macos-universal.zip").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_an_update_for_the_wrong_linux_architecture() {
+        assert_eq!(
+            asset_suffix(),
+            if cfg!(target_arch = "aarch64") {
+                "-linux-arm64.tar.gz"
+            } else {
+                "-linux.tar.gz"
+            }
+        );
+        let path = update_dir().unwrap().join("architecture-test");
+        let mut header = [0u8; 20];
+        header[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        let native_machine: u16 = if cfg!(target_arch = "aarch64") {
+            183
+        } else {
+            62
+        };
+        header[18..20].copy_from_slice(&native_machine.to_le_bytes());
+        fs::write(&path, header).unwrap();
+        assert!(verify_linux_architecture(&path).is_ok());
+        header[18..20]
+            .copy_from_slice(&if native_machine == 62 { 183u16 } else { 62u16 }.to_le_bytes());
+        fs::write(&path, header).unwrap();
+        assert!(verify_linux_architecture(&path).is_err());
     }
 
     #[cfg(target_os = "macos")]

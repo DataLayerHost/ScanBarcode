@@ -72,7 +72,9 @@ The application opens as a native window. On macOS it requests camera permission
 cargo build --release
 ```
 
-Release packages are produced automatically by GitHub Actions for macOS, Windows, and Linux when a non-prerelease GitHub Release is published. macOS has separate ARM64 and Intel ZIP downloads, each containing the native `ScanBarcode.app`; Windows ships a GUI `.exe` without a terminal window; Linux ships a desktop bundle containing a `.desktop` launcher and icon. Direct downloads use the same macOS ZIPs. See [macOS distribution details](docs/macos-app-store.md).
+Release packages are produced automatically by GitHub Actions for macOS, Windows, and Linux when a non-prerelease GitHub Release is published. macOS has separate ARM64 and Intel ZIP downloads, each containing the native `ScanBarcode.app`; Windows ships a GUI `.exe` without a terminal window; Linux ships separate x86_64 (`ScanBarcode-VERSION-linux.tar.gz`) and ARM64 (`ScanBarcode-VERSION-linux-arm64.tar.gz`) desktop bundles, each containing a `.desktop` launcher and icon. Direct downloads use the same macOS ZIPs. See [macOS distribution details](docs/macos-app-store.md).
+
+On Linux, the in-app updater chooses the archive for its CPU, verifies the release SHA-256 digest, and checks the extracted executable's ELF architecture before replacing the installed binary. The x86_64 archive keeps its existing filename so older installations continue to update. Snap Store builds receive updates through Snap instead.
 
 Release signing uses the configured repository secrets and variables:
 
@@ -85,7 +87,7 @@ Existing release assets must be rebuilt after configuring signing. Linux's tarba
 
 Create a public repository named `DataLayerHost/homebrew-tap` (on GitHub: **New repository**, owner **DataLayerHost**, name **homebrew-tap**). Generate a dedicated SSH key pair with `ssh-keygen -t ed25519 -f ~/.ssh/scanbarcode-homebrew-tap -C "ScanBarcode Homebrew publisher" -N ""`. Add `~/.ssh/scanbarcode-homebrew-tap.pub` to `homebrew-tap` under **Settings → Deploy keys → Add deploy key**, with **Allow write access** checked. Add the entire contents of the private key file (`~/.ssh/scanbarcode-homebrew-tap`) to ScanBarcode under **Settings → Secrets and variables → Actions** as `HOMEBREW_TAP_DEPLOY_KEY`. Keep the private key out of the repository and delete local copies after the secret is saved.
 
-After the release workflow succeeds, `.github/workflows/publish-homebrew.yml` downloads both notarized macOS ZIPs, verifies their signatures and stapled tickets, calculates their SHA-256 hashes, and updates `Casks/scanbarcode.rb` in the tap. Homebrew selects the matching native app for Apple Silicon or Intel. Once the tap is populated, install with:
+After the release workflow succeeds, `.github/workflows/publish-homebrew.yml` verifies the notarized macOS ZIPs and both Linux tarballs, calculates their SHA-256 hashes, and updates `Casks/scanbarcode.rb` in the tap. Homebrew installs `ScanBarcode.app` on Apple Silicon or Intel macOS and links the `scanbarcode` command on x86_64 or ARM64 Linux. The Linux build requires a graphical desktop and the runtime libraries used by the release binary. Install with the same command on either supported OS:
 
 ```sh
 brew install --cask DataLayerHost/tap/scanbarcode
@@ -101,13 +103,13 @@ After the release packaging workflow succeeds, `.github/workflows/publish-stores
 | --- | --- | --- |
 | Mac App Store | `PUBLISH_MAC_APP_STORE=true`, `APPLE_TEAM_ID`, `APP_ID`, `APPLE_STORE_APP_IDENTITY`, `APPLE_STORE_INSTALLER_IDENTITY` | `APPLE_STORE_CERTIFICATE_BASE64`, `APPLE_STORE_CERTIFICATE_PASSWORD`, `APPLE_STORE_PROFILE_BASE64`, plus the existing `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
 | Microsoft Store | `PUBLISH_MICROSOFT_STORE=true`, `MS_PACKAGE_NAME`, `MS_PACKAGE_PUBLISHER`, `MS_PUBLISHER_DISPLAY_NAME`, `MS_PRODUCT_ID` | `MS_TENANT_ID`, `MS_SELLER_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET` |
-| Snap Store | `PUBLISH_SNAP_STORE=true`, `SNAP_NAME` | `SNAPCRAFT_STORE_CREDENTIALS` |
+| Snap Store | `PUBLISH_SNAP_STORE=true` | `SNAPCRAFT_STORE_CREDENTIALS` |
 
 The Mac App Store certificate secret is a base64 `.p12` containing the Apple Distribution application identity and Mac Installer Distribution identity. The profile secret is a base64 Mac App Store Connect provisioning profile for `host.datalayer.scanbarcode`. The workflow builds a universal sandboxed `ScanBarcode.app`, creates a signed `.pkg` only as a temporary App Store upload container, deletes it after upload, and requests automatic release after App Review approval. The existing Developer ID certificate for GitHub downloads cannot be reused for this Store build.
 
 For Microsoft Store, copy the package name and publisher identity exactly from Partner Center; the workflow builds a separate MSIX package and submits it with the [Microsoft Store Developer CLI](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/overview). The first listing and first publication must be completed in Partner Center before CLI updates can run. The Microsoft Store re-signs submitted MSIX packages, so the Windows `.pfx` used for GitHub downloads is not required for this job.
 
-For Snap Store, reserve `SNAP_NAME` and create a scoped `SNAPCRAFT_STORE_CREDENTIALS` value with `snapcraft export-login`. The workflow builds a strictly confined snap and releases it to `stable` after Snap Store review. The `camera` interface normally needs a user connection (`sudo snap connect SNAP_NAME:camera`) unless the store grants auto-connection. Test camera, image picker, Wi-Fi actions, and audio on installed store builds before enabling production publication.
+For Snap Store, the package name is `dl-scanbarcode` and its displayed title is ScanBarcode. Wait until the Snap Store approves the name request, then create a `SNAPCRAFT_STORE_CREDENTIALS` secret scoped to `dl-scanbarcode` with `snapcraft export-login`. Set `PUBLISH_SNAP_STORE=true` to let the workflow build strictly confined amd64 and arm64 snaps on native Linux runners and release both to `stable` after Store review. Snap Store handles updates to installed snaps; the `store` Cargo feature disables the GitHub self-updater in these builds. The `camera` interface normally needs a user connection (`sudo snap connect dl-scanbarcode:camera`) unless the Store grants auto-connection. Test camera, image picker, Wi-Fi actions, and audio on installed store builds before enabling production publication.
 
 ## Repository layout
 

@@ -52,19 +52,19 @@ jobs:
             os: macos-15-intel
             target: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Build native Mac App Store binary
         run: cargo build --release --features store --target ${{ matrix.target }}
       - name: Validate native architecture
         shell: bash
         run: test "$(lipo -archs target/${{ matrix.target }}/release/ScanBarcode)" = '${{ matrix.arch }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: store-macos-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/ScanBarcode
@@ -87,15 +87,15 @@ jobs:
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       APP_ID: ${{ vars.APP_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: store-macos-arm64
           path: binaries/arm64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: store-macos-x86_64
           path: binaries/x86_64
@@ -175,13 +175,13 @@ jobs:
       MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
       MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Build Microsoft Store binary
         run: cargo build --release --features store --target x86_64-pc-windows-msvc
       - name: Package MSIX
@@ -231,42 +231,91 @@ jobs:
   snap-store:
     needs: release
     if: vars.PUBLISH_SNAP_STORE == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            snap_arch: amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            snap_arch: arm64
     env:
       SCANBARCODE_RELEASE_VERSION: ${{ needs.release.outputs.version }}
-      SNAP_NAME: ${{ vars.SNAP_NAME }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Install Linux camera/UI dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0 libclang-dev libv4l-dev squashfs-tools
       - name: Build Snap binary
-        run: cargo build --release --features store --target x86_64-unknown-linux-gnu
+        run: cargo build --release --features store --target ${{ matrix.target }}
       - name: Prepare Snapcraft project
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$SNAP_NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then
-            echo 'Set SNAP_NAME to the reserved Snap Store name' >&2
+          mkdir -p dist/snap-stage snap/gui
+          cp target/${{ matrix.target }}/release/ScanBarcode dist/snap-stage/ScanBarcode
+          case '${{ matrix.snap_arch }}' in
+            amd64) expected_machine='x86-64' ;;
+            arm64) expected_machine='ARM aarch64' ;;
+            *) echo 'Unsupported Snap architecture' >&2; exit 1 ;;
+          esac
+          file dist/snap-stage/ScanBarcode | grep -Fq "$expected_machine"
+          cp assets/scanbarcode-icon.png snap/gui/scanbarcode.png
+          sed 's|^Exec=.*|Exec=dl-scanbarcode|; s|^Icon=.*|Icon=${SNAP}/meta/gui/scanbarcode.png|' packaging/linux/ScanBarcode.desktop > dist/snap-stage/scanbarcode.desktop
+          sed -i "s/^version: .*/version: '$SCANBARCODE_RELEASE_VERSION'/" snap/snapcraft.yaml
+      - name: Install Snapcraft
+        run: sudo snap install snapcraft --classic
+      - name: Build Snap
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env SNAPCRAFT_BUILD_INFO=1 "$(command -v snapcraft)" pack --destructive-mode
+          shopt -s nullglob
+          snaps=(dl-scanbarcode_*_${{ matrix.snap_arch }}.snap)
+          if [ "${#snaps[@]}" -ne 1 ]; then
+            echo 'Expected exactly one Snap for this architecture' >&2
             exit 1
           fi
-          mkdir -p dist/snap-stage snap/gui
-          cp target/x86_64-unknown-linux-gnu/release/ScanBarcode dist/snap-stage/ScanBarcode
-          cp assets/scanbarcode-icon.png snap/gui/scanbarcode.png
-          sed 's|^Exec=.*|Exec=scanbarcode|; s|^Icon=.*|Icon=${SNAP}/meta/gui/scanbarcode.png|' packaging/linux/ScanBarcode.desktop > dist/snap-stage/scanbarcode.desktop
-          sed -i "s/^name: .*/name: $SNAP_NAME/; s/^version: .*/version: '$SCANBARCODE_RELEASE_VERSION'/" snap/snapcraft.yaml
-      - uses: snapcore/action-build@v1
-        id: build
-      - uses: snapcore/action-publish@v1
+          echo "snap=${snaps[0]}" >> "$GITHUB_OUTPUT"
+      - name: Verify Snap architecture
+        shell: bash
+        env:
+          SNAP_PATH: ${{ steps.build.outputs.snap }}
+        run: |
+          set -euo pipefail
+          unsquashfs -cat "$SNAP_PATH" meta/snap.yaml | awk -v expected='${{ matrix.snap_arch }}' '
+            /^architectures:/ {
+              in_arch = 1
+              if (index($0, expected)) found = 1
+              next
+            }
+            in_arch && /^[[:space:]]*-[[:space:]]+/ {
+              if ($2 == expected) found = 1
+              next
+            }
+            in_arch { exit }
+            END { exit !found }
+          '
+      - name: Publish Snap to stable
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-        with:
-          snap: ${{ steps.build.outputs.snap }}
-          release: stable
+          SNAP_PATH: ${{ steps.build.outputs.snap }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$SNAPCRAFT_STORE_CREDENTIALS" ]; then
+            echo 'Missing SNAPCRAFT_STORE_CREDENTIALS' >&2
+            exit 1
+          fi
+          snapcraft upload --release=stable "$SNAP_PATH"

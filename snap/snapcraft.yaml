@@ -1,4 +1,5 @@
-name: scanbarcode
+name: dl-scanbarcode
+title: ScanBarcode
 base: core24
 version: '0.1.3'
 summary: Scan barcodes and QR codes with your camera
@@ -8,7 +9,7 @@ grade: stable
 confinement: strict
 icon: snap/gui/scanbarcode.png
 apps:
-  scanbarcode:
+  dl-scanbarcode:
     command: bin/ScanBarcode
     desktop: usr/share/applications/scanbarcode.desktop
     extensions: [gnome]

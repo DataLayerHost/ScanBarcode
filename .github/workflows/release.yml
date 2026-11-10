@@ -34,8 +34,16 @@ jobs:
             kind: linux
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            asset_suffix: linux
+          - platform: linux-arm64
+            kind: linux
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            asset_suffix: linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate release tag
         shell: bash
         env:
@@ -48,12 +56,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Install Linux camera/UI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0 libclang-dev libv4l-dev
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package macOS app
@@ -163,16 +171,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="dist/ScanBarcode-${{ github.event.release.tag_name }}-linux"
+          STAGE="dist/ScanBarcode-${{ github.event.release.tag_name }}-${{ matrix.asset_suffix }}"
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/ScanBarcode" "$STAGE/ScanBarcode"
+          case '${{ matrix.arch }}' in
+            x86_64) expected_machine=62 ;;
+            arm64) expected_machine=183 ;;
+            *) echo 'Unsupported Linux architecture' >&2; exit 1 ;;
+          esac
+          python3 - "$STAGE/ScanBarcode" "$expected_machine" <<'PY'
+          import sys
+
+          with open(sys.argv[1], 'rb') as binary:
+              header = binary.read(20)
+          if len(header) != 20 or header[:6] != b'\x7fELF\x02\x01' or int.from_bytes(header[18:20], 'little') != int(sys.argv[2]):
+              raise SystemExit('Linux release binary architecture does not match the runner')
+          PY
           chmod +x "$STAGE/ScanBarcode"
           cp assets/scanbarcode-icon.png "$STAGE/scanbarcode.png"
           cp packaging/linux/ScanBarcode.desktop "$STAGE/ScanBarcode.desktop"
           cp LICENSE "$STAGE/LICENSE"
-          tar -C dist -czf "dist/ScanBarcode-${{ github.event.release.tag_name }}-linux.tar.gz" "ScanBarcode-${{ github.event.release.tag_name }}-linux"
+          tar -C dist -czf "$STAGE.tar.gz" "$(basename "$STAGE")"
       - name: Upload package to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.zip
@@ -186,7 +207,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: printf '%s\n' "$RELEASE_TAG" > release-tag.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: store-release-tag
           path: release-tag.txt
