@@ -2,6 +2,8 @@
 
 ScanBarcode is a desktop barcode and QR-code scanner with a live camera preview, image loading, result history, clipboard/download actions, and configurable deeplink execution.
 
+Read the [privacy policy](docs/privacy-policy.md) for details about camera access, local files, update checks, and external actions.
+
 ## Supported barcode formats
 
 The decoder backend currently supports:
@@ -90,6 +92,8 @@ brew install --cask DataLayerHost/tap/scanbarcode
 ```
 
 ### App store publishing
+
+For the first Mac App Store release, open `packaging/macos-xcode/ScanBarcode.xcodeproj`, build and archive the native Rust app in Xcode, then upload it manually through Organizer. The complete procedure and verification steps are in [macOS distribution details](docs/macos-app-store.md). This path does not require GitHub Actions.
 
 After the release packaging workflow succeeds, `.github/workflows/publish-stores.yml` can submit store-specific builds. Store builds use the `store` Cargo feature, which disables the GitHub self-updater; users receive updates through their store. Tags use `MAJOR.MINOR.PATCH` without a prefix (for example, `0.1.3`) and must match `Cargo.toml`. Each store job is enabled separately by a repository variable, so unconfigured stores are skipped.
 

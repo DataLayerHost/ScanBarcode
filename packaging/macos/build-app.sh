@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 3 ]; then
-	echo 'Usage: build-app.sh BINARY VERSION OUTPUT_APP' >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+	echo 'Usage: build-app.sh BINARY VERSION OUTPUT_APP [BUILD_NUMBER]' >&2
 	exit 2
 fi
 
 BINARY="$1"
 VERSION="$2"
 APP="$3"
+BUILD_NUMBER="${4:-$VERSION}"
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 	echo 'Version must have the form MAJOR.MINOR.PATCH' >&2
+	exit 1
+fi
+if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+	echo 'Build number must contain one to three dot-separated numbers' >&2
 	exit 1
 fi
 PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ScanBarcode") | .version')"
@@ -38,7 +43,8 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ScanBarcode.icns"
 cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = 'host.datalayer.scanbarcode'
 test "$(/usr/libexec/PlistBuddy -c 'Print :NSCameraUsageDescription' "$APP/Contents/Info.plist")" = 'ScanBarcode uses your camera to scan barcodes and QR codes.'
+test "$(/usr/libexec/PlistBuddy -c 'Print :NSHumanReadableCopyright' "$APP/Contents/Info.plist")" = '(CORE) DataLayer'
