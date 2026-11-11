@@ -61,6 +61,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
       - name: Build native Mac App Store binary
         run: cargo build --release --features store --target ${{ matrix.target }}
+      - name: Reject private macOS blur APIs
+        run: bash packaging/macos/check-store-apis.sh target/${{ matrix.target }}/release/ScanBarcode
       - name: Validate native architecture
         shell: bash
         run: test "$(lipo -archs target/${{ matrix.target }}/release/ScanBarcode)" = '${{ matrix.arch }}'

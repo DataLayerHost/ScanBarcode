@@ -31,7 +31,7 @@ Repository configuration:
 
 The checked-in project is `packaging/macos-xcode/ScanBarcode.xcodeproj`. It requires Xcode 27.2 or later for its JSON project format. The `ScanBarcode` target is macOS-only. Its build phase compiles the existing Rust/egui executable with Cargo's `store` feature, selects the architecture requested by Xcode, and places the real Rust executable at `ScanBarcode.app/Contents/MacOS/ScanBarcode` **before Xcode signs the app**. No SwiftUI launcher is included. Debug builds compile for the active Mac; Release archives compile ARM64 and Intel and combine them into a universal app. Cargo handles incremental compilation, while Xcode runs the build phase each time so Rust source edits are not missed.
 
-The bundle ID is `host.datalayer.scanbarcode`; the team is `XNG2XKLCQG`. `packaging/macos/Info.plist` supplies the app name, camera usage text, icon name, copyright `(CORE) DataLayer`, version `0.1.3`, category, and macOS 12 minimum. Xcode's **Current Project Version** supplies build number `1`. `packaging/macos/AppStore.entitlements` enables App Sandbox, camera, and read/write access to files users choose in the Open or Save dialogs. The store build disables the GitHub self-updater. The icon comes from `assets/scanbarcode-icon.png` through the shared bundle assembler.
+The bundle ID is `host.datalayer.scanbarcode`; the team is `XNG2XKLCQG`. `packaging/macos/Info.plist` supplies the app name, camera usage text, icon name, copyright `(CORE) DataLayer`, version `0.1.3`, category, and macOS 12 minimum. Xcode's **Current Project Version** supplies build number `2` for the replacement upload. `packaging/macos/AppStore.entitlements` enables App Sandbox, camera, and read/write access to files users choose in the Open or Save dialogs. The store build disables the GitHub self-updater. The icon comes from `assets/scanbarcode-icon.png` through the shared bundle assembler.
 
 ### Prepare Xcode
 
@@ -43,7 +43,7 @@ The bundle ID is `host.datalayer.scanbarcode`; the team is `XNG2XKLCQG`. `packag
 ### Build, run, archive, and upload
 
 1. Choose **Product → Build**. Xcode invokes Cargo, then signs `ScanBarcode.app`. Choose **Product → Run** to launch the native Rust app; test live camera scanning and **Load image…**. The run build may be development-signed.
-2. Increase **Current Project Version** in the target's Build Settings for each new App Store upload. Keep **Marketing Version**, `Cargo.toml`, and the release version in `packaging/macos/Info.plist` aligned. For the first upload these are marketing version `0.1.3` and build number `1`.
+2. Increase **Current Project Version** in the target's Build Settings for each new App Store upload. Keep **Marketing Version**, `Cargo.toml`, and the release version in `packaging/macos/Info.plist` aligned. The rejected upload was version `0.1.3` build `1`; the replacement is version `0.1.3` build `2`.
 3. Select **Any Mac** as the destination and choose **Product → Archive**. The Xcode build enables full DWARF information for the Rust release executable, generates a universal `ScanBarcode.app.dSYM` from the final executable before signing, and checks both architecture UUIDs. Open **Window → Organizer → Archives** and select the ScanBarcode archive. Confirm its `dSYMs` directory contains `ScanBarcode.app.dSYM` before uploading.
 4. Click **Distribute App → App Store Connect → Upload**. Leave automatic signing enabled so Xcode uses the Mac App Distribution identity and a matching Mac App Store profile, then review Xcode's validation and upload screens. This is the first-release upload path; GitHub Actions are not required.
 5. Wait for App Store Connect to process the build, then select the uploaded build for version **0.1.3** and complete the listing, compliance, and App Review fields. If an earlier build was already uploaded without symbols, increase **Current Project Version**, create a fresh archive, and upload that build; its executable UUIDs will differ from the older archive.
@@ -64,6 +64,20 @@ codesign -d --entitlements :- "$APP" 2>/dev/null
 ```
 
 The two `dwarfdump` commands must print identical UUIDs for both `x86_64` and `arm64`. Check that `CFBundleExecutable` is `ScanBarcode`, the bundle ID is `host.datalayer.scanbarcode`, the copyright is `(CORE) DataLayer`, and the camera usage description is present. A final App Store export must show the **Mac App Distribution** identity, team `XNG2XKLCQG`, a valid App Store profile for the bundle ID, App Sandbox, camera, and user-selected file entitlements. The signed upload container is temporary and must not be distributed to users.
+
+### App Review 2.5.1: private blur API
+
+Version `0.1.3` build `1` was rejected because `winit 0.30.13` linked `_CGSSetWindowBackgroundBlurRadius`, a private CoreGraphics API. The app does not request window blur. The checked-in `vendor/winit-0.30.13` keeps the compatible stable `winit` release while removing its unused private blur call. Do not replace it with the unpatched crate or enable a private blur implementation in an App Store build.
+
+The Xcode build phase checks the final executable before signing; the Mac App Store GitHub Actions job and macOS CI check their store binaries too. Verify a new archive before uploading:
+
+```sh
+APP="/path/to/ScanBarcode.xcarchive/Products/Applications/ScanBarcode.app"
+bash packaging/macos/check-store-apis.sh "$APP/Contents/MacOS/ScanBarcode"
+! nm -u "$APP/Contents/MacOS/ScanBarcode" | grep -E '_CGS(SetWindowBackgroundBlurRadius|MainConnectionID)'
+```
+
+Upload build `2` through Organizer, select that new build for App Store Connect version `0.1.3`, then resubmit the version for review. The old build `1` remains rejected; uploading a corrected archive does not change it.
 
 ## Optional GitHub Actions Mac App Store publication
 

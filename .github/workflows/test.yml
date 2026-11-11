@@ -28,3 +28,8 @@ jobs:
         run: cargo test --all-targets
       - name: Build release binary
         run: cargo build --release
+      - name: Check Mac App Store binary for private APIs
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --features store
+          bash packaging/macos/check-store-apis.sh target/release/ScanBarcode

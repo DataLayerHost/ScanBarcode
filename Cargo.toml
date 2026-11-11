@@ -40,3 +40,8 @@ rxing = { version = "0.9.3", default-features = false, features = [
 [dev-dependencies]
 rxing = { version = "0.9.3", default-features = false, features = ["encoders"] }
 
+# winit 0.30.13 links a private macOS blur API even when this app never enables
+# window blur. Keep the compatible stable version while removing that call.
+[patch.crates-io]
+winit = { path = "vendor/winit-0.30.13" }
+

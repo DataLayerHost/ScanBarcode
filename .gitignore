@@ -2,11 +2,10 @@
 /target/
 /dist/
 /release/
-Cargo.lock
 *.lock
+!/Cargo.lock
 
-# Local vendored/temporary dependency overrides
-/vendor/
+# The checked-in winit patch is required for Mac App Store builds.
 
 # Logs and runtime output
 *.log

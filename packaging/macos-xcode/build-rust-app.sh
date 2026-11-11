@@ -76,6 +76,7 @@ for arch in $ARCH_LIST; do
 	lipo -verify_arch "$arch" "$APP/Contents/MacOS/ScanBarcode"
 done
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")" = ScanBarcode
+bash "$REPO_ROOT/packaging/macos/check-store-apis.sh" "$APP/Contents/MacOS/ScanBarcode"
 
 if [ "$CARGO_PROFILE" = release ]; then
 	EXECUTABLE="$APP/Contents/MacOS/ScanBarcode"
